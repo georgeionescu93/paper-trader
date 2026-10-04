@@ -1,0 +1,39 @@
+# Never bake runtime state into the image.
+paper_trading_app.db
+paper_trading_app.db-wal
+paper_trading_app.db-shm
+web_config.json
+.env
+data/
+docs/
+
+# Deployment secrets and keys - these live on your PC, never in an image.
+deploy/my-deployment.ps1
+deploy/keys/
+*.key
+*.pub
+id_ed25519*
+
+# Machine-specific market-data caches (the server rebuilds them)
+tv_sp500_cache.json
+tv_symbol_cache.json
+
+# Python noise
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local/backup copies
+*.bak
+*—*копия*.py
+*копия*.py
+
+# Tooling
+.git/
+.gitignore
+.idea/
+.vscode/
+*.log
+

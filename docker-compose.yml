@@ -1,0 +1,86 @@
+# Paper Trader (web build) - one command, runs until you stop it.
+#
+#   docker compose up -d          start / update
+#   docker compose logs -f        watch it work
+#   docker compose down           stop (the database survives)
+#
+# `restart: unless-stopped` is what makes it survive a reboot or a crash, so
+# the engine keeps scanning whether or not your own computer is on.
+
+services:
+  paper-trader:
+    build: .
+    image: paper-trader:latest
+    container_name: paper-trader
+    restart: unless-stopped
+
+    # Published on the host loopback ONLY. Put nginx/Caddy (or a Cloudflare
+    # Tunnel) in front for TLS - never expose this port raw to the internet,
+    # because the session cookie would travel in clear text.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      # The SQLite database (account, positions, ledger, risk state) and
+      # web_config.json (password hash, session secret, auto-start) live here.
+      - ./data:/data
+
+    environment:
+      PAPER_TRADER_DB: /data/paper_trading_app.db
+      PAPER_TRADER_CONFIG: /data/web_config.json
+
+      # --- accounts -----------------------------------------------------------
+      # The account that adopts portfolios created before multi-user support.
+      # It is created from the password the app prints on first start.
+      PAPER_TRADER_OWNER_EMAIL: ${PAPER_TRADER_OWNER_EMAIL:-owner@localhost}
+      # Empty = anyone with the link can sign up (open registration).
+      # Set a word here to require an invite code instead.
+      PAPER_TRADER_REGISTRATION_CODE: ${PAPER_TRADER_REGISTRATION_CODE:-}
+
+      # --- AI analysis --------------------------------------------------------
+      # On a server there is usually no Ollama, so point the analysis at any
+      # OpenAI-compatible endpoint. LLM_BASE_URL wins when it is set.
+      # Example: LLM_BASE_URL=https://api.deepseek.com/v1  LLM_MODEL=deepseek-chat
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_TIMEOUT_S: ${LLM_TIMEOUT_S:-300}
+
+      # Only used when LLM_BASE_URL is empty. Leave blank to keep the built-in
+      # default (http://localhost:11434, i.e. Ollama inside this container or on
+      # the Docker host via host.docker.internal below).
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_TIMEOUT_S: "600"
+      TZ: ${TZ:-Europe/Bucharest}
+
+    # Needed for host.docker.internal on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -------------------------------------------------------------------------
+  # OPTIONAL: run Ollama next to the app instead of on the host.
+  #
+  #   docker compose --profile ollama up -d
+  #
+  # and set OLLAMA_BASE_URL=http://ollama:11434 for the app. A GPU is strongly
+  # recommended for local models; the default analysis model is a cloud model
+  # (deepseek-v4-pro:cloud) which only needs outbound HTTPS, not a GPU.
+  # -------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: paper-trader-ollama
+    restart: unless-stopped
+    profiles: ["ollama"]
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+
+volumes:
+  ollama-models:

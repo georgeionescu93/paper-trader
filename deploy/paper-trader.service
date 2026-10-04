@@ -1,0 +1,70 @@
+# systemd unit for the paper trader web build - the "keep it running for
+# months" option when you are not using Docker.
+#
+# Install:
+#   sudo cp deploy/paper-trader.service /etc/systemd/system/
+#   sudo nano /etc/systemd/system/paper-trader.service   # fix User/WorkingDirectory
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now paper-trader
+#
+# Operate:
+#   systemctl status paper-trader
+#   journalctl -u paper-trader -f          # live log
+#   sudo systemctl restart paper-trader
+#
+# The password and the "was the engine running?" flag are remembered in
+# web_config.json, and the account lives in paper_trading_app.db.
+
+[Unit]
+Description=AI Stock Portfolio & Paper Trader (web build)
+Documentation=file:/opt/paper-trader/README_WEB.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- EDIT THESE THREE ------------------------------------------------------
+User=paper
+Group=paper
+WorkingDirectory=/opt/paper-trader
+# ---------------------------------------------------------------------------
+
+# Loopback only; nginx/Caddy terminates TLS in front of it.
+ExecStart=/opt/paper-trader/.venv/bin/python app_web.py --host 127.0.0.1 --port 8080
+
+# Accounts and AI settings. Keep secrets (an API key, an invite code) in this
+# file rather than in the unit, so it can be chmod 600:
+#   PAPER_TRADER_OWNER_EMAIL=me@example.com
+#   PAPER_TRADER_REGISTRATION_CODE=let-me-in
+#   LLM_BASE_URL=https://api.deepseek.com/v1
+#   LLM_API_KEY=sk-...
+#   LLM_MODEL=deepseek-chat
+EnvironmentFile=-/opt/paper-trader/.env
+
+# Ollama, when this machine runs it (or point at another host):
+Environment=OLLAMA_TIMEOUT_S=600
+Environment=PYTHONUNBUFFERED=1
+
+# Restart forever, no matter how it died - this is the whole point.
+Restart=always
+RestartSec=5
+
+# Give the continuous engine a chance to finish the cycle in flight on stop.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# A modest hardening baseline that still allows outbound HTTPS to
+# TradingView/DuckDuckGo and the SQLite writes in the working directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/paper-trader
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paper-trader
+
+[Install]
+WantedBy=multi-user.target

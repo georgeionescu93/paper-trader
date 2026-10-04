@@ -1,0 +1,72 @@
+# The dashboard half of the free stack, for Render's free tier.
+#
+# This service ONLY serves the page and the API. The trading loop runs in GitHub
+# Actions (see .github/workflows/cycle.yml) because Render's free instances spin
+# down when nobody visits and lose their filesystem on every restart - their own
+# documentation says not to use them for production, so the ledger must not live
+# in a file on this host. It lives in PostgreSQL instead.
+#
+# How to use it:
+#   1. Push this repository to GitHub.
+#   2. Render -> New -> Blueprint -> pick the repository (it reads this file).
+#   3. Fill in the environment variables marked `sync: false` (they are asked
+#      for in the dashboard and never stored in git):
+#        DATABASE_URL                  the PostgreSQL connection string
+#        PAPER_TRADER_PASSWORD_HASH    from: py app_web.py --print-env
+#        PAPER_TRADER_SESSION_SECRET   from the same command
+#        PAPER_TRADER_OWNER_EMAIL      your e-mail
+#        PAPER_TRADER_REGISTRATION_CODE  optional invite code
+#        LLM_BASE_URL / LLM_API_KEY / LLM_MODEL   optional, for AI analysis
+#   4. Deploy, then open the service URL.
+#
+# Why the password hash and session secret are environment variables: this host
+# has no permanent disk, so web_config.json would be wiped on every restart.
+# Without them the owner password would rotate and every browser would be logged
+# out each time the service woke up.
+
+services:
+  - type: web
+    name: paper-trader
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    region: frankfurt
+    healthCheckPath: /api/health
+    autoDeploy: false
+    dockerBuildArgs:
+      - WITH_POSTGRES=1
+    envVars:
+      # --- database ---------------------------------------------------------
+      - key: DATABASE_URL
+        sync: false
+
+      # --- this host only serves; the trading loop is the GitHub workflow ----
+      - key: PAPER_TRADER_ENGINE
+        value: "off"
+
+      # --- stable secrets (the filesystem here is temporary) ----------------
+      - key: PAPER_TRADER_PASSWORD_HASH
+        sync: false
+      - key: PAPER_TRADER_SESSION_SECRET
+        sync: false
+      - key: PAPER_TRADER_CONFIG
+        value: /tmp/web_config.json
+
+      # --- accounts ---------------------------------------------------------
+      - key: PAPER_TRADER_OWNER_EMAIL
+        sync: false
+      # Empty = anyone with the link can sign up. Set a word to require it.
+      - key: PAPER_TRADER_REGISTRATION_CODE
+        sync: false
+
+      # --- AI analysis (optional) -------------------------------------------
+      - key: LLM_BASE_URL
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+
+      - key: TZ
+        value: Europe/Bucharest

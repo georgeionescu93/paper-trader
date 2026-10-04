@@ -1,1 +1,34 @@
-# placeholder, replaced by the real .gitignore
+# Secrets and runtime state - never commit these.
+web_config.json
+.env
+deploy/my-deployment.ps1
+deploy/cloud-env.txt
+deploy/db-url.txt
+deploy/gh-token.txt
+deploy/keys/
+paper_trading_app.db
+paper_trading_app.db-wal
+paper_trading_app.db-shm
+data/
+
+# Local backups the user keeps next to the app
+*.bak
+*копия*.py
+*—*копия*.py
+
+# Market-data caches (rebuilt automatically, machine specific)
+tv_sp500_cache.json
+tv_symbol_cache.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+*.log
+Thumbs.db
+desktop.ini

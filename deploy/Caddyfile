@@ -1,0 +1,29 @@
+# Paper Trader - TLS termination and reverse proxy.
+#
+# Caddy is used here instead of nginx because it obtains and renews a Let's
+# Encrypt certificate with no extra configuration at all: point a DNS record at
+# the VM, start Caddy with DOMAIN set, and HTTPS works.
+#
+#   docker run -d --name paper-caddy --restart unless-stopped --network host \
+#     -e DOMAIN=trader.example.com \
+#     -v /opt/paper-trader/deploy/Caddyfile:/etc/caddy/Caddyfile:ro \
+#     -v paper-caddy-data:/data -v paper-caddy-config:/config caddy:2
+#
+# deploy/oracle-cloud-setup.sh does exactly this when you pass DOMAIN.
+#
+# Requirements: ports 80 AND 443 reachable from the internet (Let's Encrypt
+# validates over 80, then serves over 443). See that script for the two
+# firewalls Oracle puts in the way - the VCN Security List and iptables.
+
+{$DOMAIN} {
+	encode gzip
+
+	# The app binds to the loopback only; Caddy is on the host network, so it
+	# can reach it directly.
+	reverse_proxy 127.0.0.1:8080
+
+	log {
+		output stdout
+		format console
+	}
+}

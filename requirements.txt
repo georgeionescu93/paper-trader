@@ -1,0 +1,30 @@
+# Runtime requirements for the paper trader (web AND desktop build).
+#
+# The web server itself (app_web.py) uses ONLY the standard library, so these
+# two are needed for the parts that actually need them: market data (tv_data)
+# and the candle engine (paper_trading_app_TV).
+#
+#   pip install -r requirements.txt
+#
+pandas>=2.0
+websocket-client>=1.6
+
+# The accounts layer (accounts.py) and the optional OpenAI-compatible client
+# (cloud_llm.py) are standard library only - no extra package for either.
+
+# ---------------------------------------------------------------------------
+# OPTIONAL - better candlestick patterns
+# ---------------------------------------------------------------------------
+# TA-Lib gives all 61 candlestick patterns. It is a C library with Python
+# bindings, so it is NOT a pip-only install:
+#
+#   Debian/Ubuntu:  sudo apt-get install -y build-essential ta-lib
+#                   pip install TA-Lib
+#   macOS:          brew install ta-lib && pip install TA-Lib
+#   Windows:        pip install TA-Lib        (wheels exist for CPython)
+#
+# Without it the app automatically falls back to its built-in pure-Python
+# pattern engine - everything else (risk engine, sizing, guard rails) is
+# identical, so this is a quality upgrade, not a requirement.
+#
+# TA-Lib>=0.6

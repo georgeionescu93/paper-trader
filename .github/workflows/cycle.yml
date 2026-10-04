@@ -1,0 +1,85 @@
+# The trading half of the free stack.
+#
+# The web host (Render's free tier) sleeps when nobody visits and loses its disk
+# whenever it restarts, so the trading loop cannot live there. This workflow is
+# the loop: GitHub runs run_cycle_job.py every 15 minutes against the same
+# PostgreSQL database the dashboard reads, and pings the dashboard so it does
+# not stay asleep.
+#
+# Setup (once):
+#   1. Add the repository secret DATABASE_URL - the PostgreSQL connection
+#      string from Neon/Supabase.
+#   2. Add the repository secret WEB_URL - the Render URL of the dashboard,
+#      e.g. https://paper-trader.onrender.com (used for the keep-alive ping;
+#      leave it out and the ping step simply does nothing).
+#   3. Enable Actions if the repository is forked (schedules are off by default
+#      in forks).
+#
+# Notes that matter for a trading job:
+#   * GitHub's schedule is best-effort and in UTC: runs can be a few minutes
+#     late, and they are disabled after ~60 days without repository activity.
+#   * `concurrency` plus the app's own PostgreSQL advisory lock means two runs
+#     can never trade at the same time. A run that finds the lock held skips
+#     instead of trading twice.
+#   * A failing cycle makes this run fail, so a broken engine is visible instead
+#     of silent.
+
+name: paper-trader cycle
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paper-trader-cycle
+  cancel-in-progress: false
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # Shows up in the dashboard's activity feed as the source of the cycle.
+      PAPER_TRADER_JOB: "GitHub Actions"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-postgres.txt
+
+      - name: Run one trading cycle
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python run_cycle_job.py --json
+
+      - name: Keep the dashboard awake
+        # Render's free web service sleeps after ~15 minutes of inactivity. This
+        # ping wakes it and keeps it warm. It is deliberately non-fatal: the
+        # trading cycle above has already done the work.
+        continue-on-error: true
+        env:
+          WEB_URL: ${{ secrets.WEB_URL }}
+        run: |
+          if [ -n "$WEB_URL" ]; then
+            for attempt in 1 2 3; do
+              code=$(curl -s -o /dev/null -m 60 -w "%{http_code}" "$WEB_URL/api/health" || true)
+              echo "attempt $attempt: HTTP $code"
+              [ "$code" = "200" ] && break
+              sleep 20
+            done
+          else
+            echo "WEB_URL is not set - skipping the keep-alive ping."
+          fi

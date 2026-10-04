@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#17181c">
+<title>AI Stock Portfolio &amp; Paper Trader</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- =====================================================================
+     LOGIN / REGISTRATION  (multi-user accounts; the session lives in a
+     cookie set by the server, nothing is kept in the browser)
+     ===================================================================== -->
+<div id="login-view" class="login-wrap hidden">
+  <form id="login-form" class="login-card" autocomplete="on" novalidate>
+    <div class="login-icon">🔒</div>
+    <h1>AI Stock Portfolio &amp; Paper Trader</h1>
+    <p id="login-hint" class="muted"></p>
+    <input id="login-email" class="input login-input" type="text" inputmode="email"
+           placeholder="E-mail" autocomplete="username" spellcheck="false">
+    <input id="login-password" class="input login-input" type="password"
+           placeholder="Password" autocomplete="current-password">
+    <select id="register-currency" class="input login-input hidden"
+            aria-label="Paper currency">
+      <option value="USD">Currency: USD – US Dollar</option>
+      <option value="EUR">Currency: EUR – Euro</option>
+      <option value="GBP">Currency: GBP – British Pound</option>
+    </select>
+    <input id="register-code" class="input login-input hidden" type="text"
+           placeholder="Invite code" autocomplete="off" spellcheck="false">
+    <div id="login-error" class="login-error"></div>
+    <button type="submit" class="btn accent login-submit" id="login-submit">Sign in</button>
+    <div class="login-alt">
+      <button type="button" id="btn-show-register" class="btn ghost small">Create an account</button>
+      <button type="button" id="btn-show-login" class="btn ghost small hidden">← Back to sign in</button>
+    </div>
+  </form>
+</div>
+
+<!-- =====================================================================
+     APP
+     ===================================================================== -->
+<div id="app-view" class="hidden">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">📈</span>
+      <span class="brand-text">AI Stock Portfolio &amp; Paper Trader</span>
+    </div>
+    <div class="topbar-right">
+      <span id="user-pill" class="pill muted nowrap hidden"></span>
+      <span id="market-pill" class="pill muted">market –</span>
+      <span id="engine-pill" class="pill muted">engine idle</span>
+      <span id="server-time" class="muted nowrap"></span>
+      <button id="btn-logout" class="btn small ghost" type="button">Log out</button>
+    </div>
+  </header>
+
+  <div id="banner-tv" class="banner warn hidden"></div>
+  <div id="banner-engine" class="banner info hidden"></div>
+
+  <main class="stack">
+
+    <!-- ---------------------------------------------------------------
+         1. PROFILE MANAGEMENT
+         --------------------------------------------------------------- -->
+    <section class="panel">
+      <div class="panel-title">Profile Management</div>
+      <div class="panel-body row wrap">
+        <label class="field">
+          <span>Select Profile:</span>
+          <select id="profile-select" class="input"></select>
+        </label>
+        <button id="btn-new-profile" class="btn" type="button">➕ Create Profile</button>
+        <button id="btn-deposit" class="btn" type="button">➕ Deposit Cash</button>
+        <button id="btn-delete-profile" class="btn" type="button">🗑️ Delete Profile</button>
+        <span id="profile-meta" class="muted grow"></span>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------
+         2. AI ENGINE (OLLAMA)
+         --------------------------------------------------------------- -->
+    <section class="panel">
+      <div class="panel-title">AI Engine (Ollama)</div>
+      <div class="panel-body stack-tight">
+        <div class="row wrap">
+          <label class="field">
+            <span>🤖 Model:</span>
+            <input id="model-select" class="input mono" list="model-options"
+                   placeholder="deepseek-v4-pro:cloud" spellcheck="false">
+            <datalist id="model-options"></datalist>
+          </label>
+          <button id="btn-refresh-models" class="btn" type="button">🔄 Refresh Models</button>
+          <span id="model-status" class="muted grow"></span>
+        </div>
+        <div class="row wrap">
+          <label class="check" title="Inject fresh DuckDuckGo results into the prompt">
+            <input id="chk-web" type="checkbox" checked> 🌐 Web Search
+          </label>
+          <label class="check" title="Refresh the dashboard automatically">
+            <input id="chk-live" type="checkbox" checked> ⏱ Live Prices (<span id="live-secs">5</span>s)
+          </label>
+          <span class="sep"></span>
+          <span class="muted">Analysis lens:</span>
+          <label class="check"><input id="chk-fundamental" type="checkbox" checked> 📊 Fundamental</label>
+          <label class="check"><input id="chk-technical" type="checkbox" checked> 📈 Technical</label>
+          <span class="muted">(both = combined)</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------
+         3. ACCOUNT OVERVIEW
+         --------------------------------------------------------------- -->
+    <section class="panel">
+      <div class="panel-title">Account Overview</div>
+      <div class="panel-body stack-tight">
+        <div class="row wrap baseline">
+          <span id="lbl-cash" class="hdr">Cash Balance: –</span>
+          <span id="lbl-equity" class="hdr">Portfolio Value: –</span>
+          <span id="lbl-total" class="hdr">Net Worth: –</span>
+          <span id="lbl-updated" class="muted"></span>
+          <span class="grow"></span>
+          <label class="check strong" title="Execute the AI / engine decisions automatically">
+            <input id="chk-auto" type="checkbox"> 🤖 Auto-Trade (Auto Buy/Sell)
+          </label>
+        </div>
+        <div class="row wrap baseline">
+          <span id="lbl-realized" class="pl muted">Realized P/L: –</span>
+          <span id="lbl-unrealized" class="pl muted">Unrealized P/L: –</span>
+          <span id="lbl-overall" class="pl muted">Overall P/L: –</span>
+          <span id="lbl-avg-pos" class="pl muted">Avg position P/L: –</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------
+         4. ANALYSIS & TRADING CONTROLS
+         --------------------------------------------------------------- -->
+    <section class="panel">
+      <div class="panel-title">Analysis &amp; Trading Mode</div>
+      <div class="panel-body stack-tight">
+        <div class="row wrap">
+          <button id="btn-analyse" class="btn accent" type="button">🚀 Start AI Market Analysis</button>
+          <button id="btn-trading-mode" class="btn accent" type="button">▶️ Trading Mode</button>
+          <button id="btn-one-cycle" class="btn" type="button"
+                  title="Run one scan/decide/execute cycle now">⏭️ One Cycle</button>
+          <label class="field">
+            <span>Timeframe:</span>
+            <select id="timeframe-select" class="input"></select>
+          </label>
+        </div>
+        <div class="row wrap">
+          <span id="lbl-status" class="status">Status: Ready</span>
+        </div>
+        <div class="row wrap engine-metrics">
+          <span class="metric"><b>Cycle</b> <span id="m-cycle">–</span></span>
+          <span class="metric"><b>Scanned</b> <span id="m-scanned">–</span></span>
+          <span class="metric"><b>Candles</b> <span id="m-fetch">–</span></span>
+          <span class="metric"><b>Decisions</b> <span id="m-decisions">–</span></span>
+          <span class="metric"><b>Next scan in</b> <span id="m-next">–</span></span>
+          <span class="metric"><b>Last cycle</b> <span id="m-last">–</span></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------
+         5. RISK ENGINE (capital protection) - never a hidden assumption
+         --------------------------------------------------------------- -->
+    <section class="panel">
+      <div class="panel-title">🛡️ Risk Engine (capital protection)</div>
+      <div class="panel-body row wrap space-between">
+        <span id="lbl-risk-rules" class="muted"></span>
+        <span id="lbl-risk-state" class="pl muted">Risk state: –</span>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------
+         6. AI RECOMMENDATIONS & EXECUTION
+         --------------------------------------------------------------- -->
+    <section class="panel grow-panel">
+      <div class="panel-title">
+        AI Recommendations &amp; Execution
+        <span id="recs-source" class="muted small normal"></span>
+      </div>
+      <div class="panel-body stack-tight">
+        <div class="table-wrap recs-wrap">
+          <table class="data">
+            <thead>
+              <tr>
+                <th>Action</th><th>Symbol</th><th>Suggested Shares</th>
+                <th>Estimated Amount</th><th class="wide">Rationale</th>
+              </tr>
+            </thead>
+            <tbody id="recs-body"></tbody>
+            <tfoot id="recs-empty" class="empty-row hidden">
+              <tr><td colspan="5" class="muted">No recommendations yet – run an
+                AI analysis or start Trading Mode.</td></tr>
+            </tfoot>
+          </table>
+        </div>
+        <div class="row wrap action-bar">
+          <label class="field"><span>Symbol:</span>
+            <input id="inp-symbol" class="input sym" placeholder="AAPL"
+                   spellcheck="false" autocomplete="off"></label>
+          <label class="field"><span>Qty:</span>
+            <input id="inp-qty" class="input sym" placeholder="10"
+                   inputmode="decimal" autocomplete="off"></label>
+          <button id="btn-buy" class="btn buy" type="button">🟢 BUY</button>
+          <button id="btn-sell" class="btn sell" type="button">🔴 SELL</button>
+          <span class="muted grow" id="trade-hint">Click a recommendation to fill
+            the symbol and quantity.</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------
+         7. TABS: holdings / history / activity
+         --------------------------------------------------------------- -->
+    <section class="panel grow-panel">
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="holdings" role="tab" type="button">Current Holdings</button>
+        <button class="tab" data-tab="history" role="tab" type="button">Trade History</button>
+        <button class="tab" data-tab="activity" role="tab" type="button">Activity</button>
+      </div>
+
+      <div class="tab-panel" id="panel-holdings">
+        <div class="table-wrap">
+          <table class="data">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Shares</th><th>Avg Buy Price</th>
+                <th>Current Price</th><th>Total Value</th><th>Profit/Loss</th>
+                <th title="Protective stop-loss / take-profit stored by the risk engine">Stop / Target</th>
+              </tr>
+            </thead>
+            <tbody id="holdings-body"></tbody>
+          </table>
+        </div>
+        <p id="holdings-empty" class="muted pad">No open positions.</p>
+      </div>
+
+      <div class="tab-panel hidden" id="panel-history">
+        <div class="row wrap hist-bar">
+          <button id="btn-edit-price" class="btn" type="button">✏️ Edit Price of Selected Trade</button>
+          <button id="btn-clear-history" class="btn danger" type="button">🧹 Clear History</button>
+          <span class="muted grow">Select a trade to correct its execution price –
+            cash, average cost and realized P/L are recalculated.</span>
+        </div>
+        <div class="table-wrap">
+          <table class="data">
+            <thead>
+              <tr>
+                <th>Time</th><th>Action</th><th>Symbol</th><th>Qty</th>
+                <th>Price</th><th>Total</th><th>Realized P/L</th>
+                <th class="wide">Reason</th>
+              </tr>
+            </thead>
+            <tbody id="history-body"></tbody>
+          </table>
+        </div>
+        <p id="history-empty" class="muted pad">No trades yet.</p>
+      </div>
+
+      <div class="tab-panel hidden" id="panel-activity">
+        <div class="row wrap hist-bar">
+          <span class="muted grow">Everything the server-side engine did, newest
+            last – it keeps working with this page closed.</span>
+        </div>
+        <ol id="log-list" class="log"></ol>
+      </div>
+    </section>
+
+    <footer class="foot muted">
+      <span id="foot-build"></span>
+      <span class="grow"></span>
+      <span>Market data: TradingView · Patterns: <span id="foot-patterns">–</span></span>
+    </footer>
+  </main>
+</div>
+
+<!-- toasts + modal -->
+<div id="toasts" class="toasts"></div>
+<div id="modal-root" class="modal-root hidden" aria-hidden="true">
+  <div class="modal-backdrop" data-close="1"></div>
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head"><span id="modal-icon">ℹ️</span>
+      <h2 id="modal-title">Notice</h2></div>
+    <div class="modal-body">
+      <p id="modal-message" class="modal-message"></p>
+      <input id="modal-input" class="input hidden" autocomplete="off">
+      <select id="modal-select" class="input hidden"></select>
+      <div id="modal-error" class="login-error"></div>
+    </div>
+    <div class="modal-foot">
+      <button id="modal-ok" class="btn accent" type="button">OK</button>
+      <button id="modal-cancel" class="btn hidden" type="button">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script src="app-client.js"></script>
+</body>
+</html>

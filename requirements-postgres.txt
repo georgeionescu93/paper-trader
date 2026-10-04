@@ -1,0 +1,10 @@
+# PostgreSQL backend for the app, needed ONLY when it runs against a hosted
+# database (PAPER_TRADER_DB_URL / DATABASE_URL points at PostgreSQL).
+#
+# The desktop build and a plain SQLite deployment do NOT need this file:
+# pg_compat.py is a no-op unless a PostgreSQL URL is configured, and the app
+# keeps using sqlite3 from the standard library.
+#
+#   pip install -r requirements-postgres.txt
+#
+psycopg2-binary>=2.9
