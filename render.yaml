@@ -39,8 +39,10 @@ services:
     region: frankfurt
     healthCheckPath: /api/health
     autoDeploy: false
-    dockerBuildArgs:
-      - WITH_POSTGRES=1
+    # No dockerBuildArgs here: Render's blueprint schema has no such field
+    # ("field dockerBuildArgs not found in type file.Service"), and it cannot
+    # pass build arguments anyway. The Dockerfile installs psycopg2
+    # unconditionally instead of behind a build argument.
     envVars:
       # --- database ---------------------------------------------------------
       - key: DATABASE_URL
