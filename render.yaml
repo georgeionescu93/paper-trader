@@ -24,6 +24,11 @@
 # Without them the owner password would rotate and every browser would be logged
 # out each time the service woke up.
 
+# NEVER put a value in a `key:` field. Variables marked `sync: false`
+# are typed into Render's form, in the Value column - writing them here
+# publishes them to everyone who can read this repository, which is what
+# happened on 2026-10-04 and forced the credentials to be rotated.
+
 services:
   - type: web
     name: paper-trader
@@ -38,7 +43,7 @@ services:
       - WITH_POSTGRES=1
     envVars:
       # --- database ---------------------------------------------------------
-      - key: postgresql://neondb_owner:npg_Kkxn3FMNpAs4@ep-twilight-hall-b5tnkl4q.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require
+      - key: DATABASE_URL
         sync: false
 
       # --- this host only serves; the trading loop is the GitHub workflow ----
@@ -46,15 +51,15 @@ services:
         value: "off"
 
       # --- stable secrets (the filesystem here is temporary) ----------------
-      - key: 9cfb71ba66c02dae1d165be2fafca8c3$4ca12d3eefa3f762601ad2a5c74fa17bc437124a1522384f2bf726aa469d3828
+      - key: PAPER_TRADER_PASSWORD_HASH
         sync: false
-      - key: 05298c2afaf555c61b8c2cbed2e8a5681010333255af8bee3a2490a21a2e2b18
+      - key: PAPER_TRADER_SESSION_SECRET
         sync: false
       - key: PAPER_TRADER_CONFIG
         value: /tmp/web_config.json
 
       # --- accounts ---------------------------------------------------------
-      - key: owner@localhost
+      - key: PAPER_TRADER_OWNER_EMAIL
         sync: false
       # Empty = anyone with the link can sign up. Set a word to require it.
       - key: PAPER_TRADER_REGISTRATION_CODE
