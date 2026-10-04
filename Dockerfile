@@ -58,14 +58,12 @@ WORKDIR /app
 
 # Dependencies first, so a code edit does not re-resolve them.
 COPY requirements.txt requirements-postgres.txt ./
-# WITH_POSTGRES=1 adds the psycopg2 driver, which is only needed when the app
-# talks to a hosted PostgreSQL database (the free split stack). A plain SQLite
-# deployment does not install it.
-ARG WITH_POSTGRES=0
-RUN pip install --no-cache-dir -r requirements.txt \
- && if [ "$WITH_POSTGRES" = "1" ]; then \
-      pip install --no-cache-dir -r requirements-postgres.txt; \
-    fi
+# psycopg2 is always installed, even for a plain SQLite deployment: it is a
+# small wheel and costs nothing at runtime. It used to be conditional on a
+# WITH_POSTGRES build argument, but platforms that build from a blueprint
+# (Render) cannot pass build arguments at all, so the conditional would have
+# produced an image that silently could not reach PostgreSQL.
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-postgres.txt
 
 # Application code. tv_data.py and engine.py must sit next to
 # paper_trading_app_TV.py - app_web.py imports all three. accounts.py and
