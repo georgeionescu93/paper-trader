@@ -252,6 +252,54 @@ class Statement:
         return f"Statement({self.kind!r}, {self.sql!r}, table={self.table!r})"
 
 
+# ---------------------------------------------------------------------------
+# SQLite's two-argument scalar MAX() / MIN()
+# ---------------------------------------------------------------------------
+# SQLite defines MAX(a, b) and MIN(a, b) as scalar functions that return the
+# larger / smaller argument. PostgreSQL has no such function: there MAX and MIN
+# are aggregates only, and the scalar form is spelled GREATEST() / LEAST(). So
+# `MAX(COALESCE(stop_loss, ?), ?)` fails on Postgres with
+#     function max(numeric, numeric) does not exist
+# That exact statement is how a Trading Mode entry records its protective stop,
+# in both engine.py and paper_trading_app_TV.py. Because the failure was being
+# swallowed by a bare `except sqlite3.Error: return False`, every hosted entry
+# silently failed to book while every scan and recommendation looked healthy.
+_SCALAR_FUNC = re.compile(r"\b(MAX|MIN)\s*\(", re.I)
+
+
+def _scalar_maxmin(sql):
+    """Two-argument MAX()/MIN() -> GREATEST()/LEAST(); aggregates untouched."""
+    out = []
+    i = 0
+    while i < len(sql):
+        match = _SCALAR_FUNC.search(sql, i)
+        if not match:
+            out.append(sql[i:])
+            break
+        out.append(sql[i:match.end()])
+        start = match.end()                  # just past the opening paren
+        depth, comma, j = 1, False, start
+        while j < len(sql) and depth:
+            ch = sql[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if not depth:
+                    break
+            elif ch == "," and depth == 1:
+                comma = True
+            j += 1
+        if depth or not comma:               # single argument: an aggregate
+            i = match.end()
+            continue
+        name = "GREATEST" if match.group(1).upper() == "MAX" else "LEAST"
+        out[-1] = sql[i:match.start()] + name + "("
+        out.append(sql[start:j] + ")")
+        i = j + 1
+    return "".join(out)
+
+
 def translate(sql, params=None):
     """Pure translation: no database access, so it is unit-testable."""
     if not isinstance(sql, str):
@@ -279,7 +327,7 @@ def translate(sql, params=None):
 
     # COLLATE NOCASE binds tighter than '=', so `email = ? COLLATE NOCASE`
     # means a case-insensitive comparison. lower(...) is the portable form.
-    nocase = _NOCASE.sub(r"lower(\1)", sql)
+    nocase = _scalar_maxmin(_NOCASE.sub(r"lower(\1)", sql))
     text, seen = _scan(nocase, escape_percent=params is not None)
     if params is not None and seen == 0:
         # Parameters with no placeholder: they will not be interpolated, so a
