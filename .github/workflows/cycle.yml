@@ -40,7 +40,10 @@ concurrency:
 
 jobs:
   cycle:
-    runs-on: ubuntu-latest
+    # Pinned to an LTS image deliberately: GitHub moves `ubuntu-latest` to
+    # Ubuntu 26 on 19 October 2026, and a trading job should not change
+    # underneath itself. Bump this on purpose, not automatically.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     env:
@@ -48,9 +51,10 @@ jobs:
       PAPER_TRADER_JOB: "GitHub Actions"
 
     steps:
-      - uses: actions/checkout@v4
+      # v7 of both actions: v4/v5 still run on Node 20, which GitHub is retiring.
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
