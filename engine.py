@@ -832,6 +832,11 @@ class TradingEngine:
                 detail += (f"; {len(skipped)} skipped by the risk engine/guard "
                            "rails.")
             self.log(f"{label or 'Auto'}: {detail}")
+        elif planned:
+            # Planned trades that booked nothing is never normal: say so loudly
+            # instead of leaving a cycle that looks like it simply found nothing.
+            self.log(f"\u26a0\ufe0f {label or 'Auto'}: {planned} order(s) planned "
+                     f"but none could be booked - see the warnings above.")
         return summary
 
     # -- trade booking -------------------------------------------------------
@@ -936,8 +941,15 @@ class TradingEngine:
                  symbol, qty, price, total_cost, reason, realized_pnl))
             conn.commit()
             return True
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
             conn.rollback()
+            # Never fail silently: a swallowed error here means a trade the user
+            # was told about never booked. This is exactly how the hosted build
+            # lost every entry for five days (SQLite's two-argument MAX() is not
+            # a PostgreSQL function, so the protective-stop UPDATE raised).
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.log(f"\u26a0\ufe0f could not book {action} {symbol}: "
+                     f"{self.last_error}")
             return False
         finally:
             conn.close()
