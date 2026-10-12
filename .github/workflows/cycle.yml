@@ -2,9 +2,17 @@
 #
 # The web host (Render's free tier) sleeps when nobody visits and loses its disk
 # whenever it restarts, so the trading loop cannot live there. This workflow is
-# the loop: GitHub runs run_cycle_job.py every 15 minutes against the same
-# PostgreSQL database the dashboard reads, and pings the dashboard so it does
-# not stay asleep.
+# the loop: GitHub starts run_cycle_job.py, which then keeps cycling by itself
+# until the US session closes.
+#
+# Why a cron AND a loop: GitHub's cron is best-effort and would only fire a few
+# times a day, far too rarely for a 15-minute rescan. So each trigger stays alive
+# for up to five hours, cycling once per due interval, and the next trigger takes
+# over. Between them the market is covered continuously.
+#
+# Outside the session (Mon-Fri 09:30-16:00 ET) the job stops before it touches
+# the database: no scan, no feed entry, no order. Closed-market runs are green,
+# not failures.
 #
 # Setup (once):
 #   1. Add the repository secret DATABASE_URL - the PostgreSQL connection
@@ -16,8 +24,9 @@
 #      in forks).
 #
 # Notes that matter for a trading job:
-#   * GitHub's schedule is best-effort and in UTC: runs can be a few minutes
-#     late, and they are disabled after ~60 days without repository activity.
+#   * The cron below fires only on weekdays around the US session, in UTC. US
+#     clock changes shift the session by an hour twice a year; the job's own
+#     market gate is what actually decides, so this window is deliberately wide.
 #   * `concurrency` plus the app's own PostgreSQL advisory lock means two runs
 #     can never trade at the same time. A run that finds the lock held skips
 #     instead of trading twice.
@@ -28,8 +37,28 @@ name: paper-trader cycle
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # 13:00-21:45 UTC, Monday to Friday. In summer that is 09:00-17:45 ET and in
+    # winter 08:00-16:45 ET, so the US regular session is covered with an hour of
+    # slack on either side whichever way the clocks have moved. Triggers outside
+    # the session are cheap green no-ops thanks to the job's own market gate.
+    - cron: "*/15 13-21 * * 1-5"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "loop = keep cycling until the market closes; once = one cycle"
+        type: choice
+        options: [loop, once]
+        default: loop
+      every_seconds:
+        description: "how often the loop re-checks whether a portfolio is due"
+        default: "60"
+      max_hours:
+        description: "give up the loop after this many hours (GitHub kills a job at 6)"
+        default: "5"
+      ignore_market_hours:
+        description: "run even when the US session is closed (testing only)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -44,11 +73,17 @@ jobs:
     # Ubuntu 26 on 19 October 2026, and a trading job should not change
     # underneath itself. Bump this on purpose, not automatically.
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Long enough for the loop to cover a whole session, short enough that this
+    # ends well before GitHub's hard 6-hour limit.
+    timeout-minutes: 350
 
     env:
       # Shows up in the dashboard's activity feed as the source of the cycle.
       PAPER_TRADER_JOB: "GitHub Actions"
+      MODE: ${{ github.event.inputs.mode }}
+      EVERY_SECONDS: ${{ github.event.inputs.every_seconds }}
+      MAX_HOURS: ${{ github.event.inputs.max_hours }}
+      IGNORE_MARKET_HOURS: ${{ github.event.inputs.ignore_market_hours }}
 
     steps:
       # v7 of both actions: v4/v5 still run on Node 20, which GitHub is retiring.
@@ -64,15 +99,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-postgres.txt
 
-      - name: Run one trading cycle
+      - name: Run trading cycles
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python run_cycle_job.py --json
+          # Empty on scheduled runs, where the job falls back to its defaults.
+          PAPER_TRADER_EVERY_SECONDS: ${{ github.event.inputs.every_seconds }}
+          PAPER_TRADER_MAX_HOURS: ${{ github.event.inputs.max_hours }}
+        run: |
+          FLAGS="--json"
+          if [ "$MODE" != "once" ]; then
+            FLAGS="$FLAGS --loop"
+          fi
+          if [ "$IGNORE_MARKET_HOURS" = "true" ]; then
+            FLAGS="$FLAGS --ignore-market-hours"
+          fi
+          echo "python run_cycle_job.py $FLAGS"
+          python run_cycle_job.py $FLAGS
 
       - name: Keep the dashboard awake
         # Render's free web service sleeps after ~15 minutes of inactivity. This
         # ping wakes it and keeps it warm. It is deliberately non-fatal: the
-        # trading cycle above has already done the work.
+        # trading cycles above have already done the work.
         continue-on-error: true
         env:
           WEB_URL: ${{ secrets.WEB_URL }}
