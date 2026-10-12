@@ -1311,13 +1311,37 @@ def build_router():
             users = accounts.count(conn)
         finally:
             conn.close()
+        # `engine_running` is only this web host's scheduler thread, which stays
+        # alive even when PAPER_TRADER_ENGINE=off hands the work to GitHub - read
+        # alone it suggests trading happens here, which is the wrong conclusion.
+        # These three answer the real question instead: which setting is in force,
+        # is the session open, and when is the next cycle due.
+        extra = {}
+        try:
+            import tv_data
+            extra["market_open"] = bool(tv_data.market_is_open())
+        except Exception:                                   # noqa: BLE001
+            extra["market_open"] = None
+        try:
+            import cycle_state as cycle_state_mod
+            conn = state.connect()
+            try:
+                row = conn.execute(
+                    "SELECT min(next_run_at) FROM cycle_state").fetchone()
+                extra["next_cycle_due"] = row[0] if row else None
+            finally:
+                conn.close()
+        except Exception:                                   # noqa: BLE001
+            extra["next_cycle_due"] = None
+        extra["engine_setting"] = os.environ.get("PAPER_TRADER_ENGINE") or "(unset)"
         h._json({"ok": True, "engine_running": state.engine.running,
                  "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                  "talib": bool(app.TALIB_AVAILABLE),
                  "pandas": bool(app.PANDAS_AVAILABLE),
                  "tv_available": bool(app.TV_DATA_AVAILABLE),
                  "users": users,
-                 "registration_open": not _registration_code()})
+                 "registration_open": not _registration_code(),
+                 **extra})
 
     # ---- state -------------------------------------------------------------
     @route("GET", r"/api/state")
