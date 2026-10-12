@@ -1327,12 +1327,23 @@ def build_router():
             conn = state.connect()
             try:
                 row = conn.execute(
-                    "SELECT min(next_run_at) FROM cycle_state").fetchone()
-                extra["next_cycle_due"] = row[0] if row else None
+                    "SELECT min(next_run_at) AS next_due FROM cycle_state"
+                ).fetchone()
+                value = None
+                if row is not None:
+                    if hasattr(row, "get"):
+                        value = row.get("next_due")
+                    elif isinstance(row, (list, tuple)):
+                        value = row[0]
+                    else:
+                        value = list(row)[0]
+                extra["next_cycle_due"] = None if value is None else str(value)
             finally:
                 conn.close()
-        except Exception:                                   # noqa: BLE001
+        except Exception as exc:                            # noqa: BLE001
+            # Say so rather than pretending there is no schedule.
             extra["next_cycle_due"] = None
+            extra["schedule_error"] = f"{type(exc).__name__}: {exc}"
         extra["engine_setting"] = os.environ.get("PAPER_TRADER_ENGINE") or "(unset)"
         h._json({"ok": True, "engine_running": state.engine.running,
                  "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
