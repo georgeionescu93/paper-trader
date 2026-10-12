@@ -42,6 +42,13 @@ on:
     # slack on either side whichever way the clocks have moved. Triggers outside
     # the session are cheap green no-ops thanks to the job's own market gate.
     - cron: "*/15 13-21 * * 1-5"
+    # Safety net for GitHub's unreliable timer. A scheduled workflow can be
+    # delayed or dropped, and if the day's triggers all land before the opening
+    # bell the session would be missed. These hourly morning triggers arrive
+    # before the bell on purpose: the job waits for 09:30 ET (up to four hours)
+    # and then trades the session, so an early trigger still produces a full
+    # day of cover. The concurrency group turns the extra triggers into a relay.
+    - cron: "0 10-12 * * 1-5"
   workflow_dispatch:
     inputs:
       mode:
