@@ -1323,7 +1323,6 @@ def build_router():
         except Exception:                                   # noqa: BLE001
             extra["market_open"] = None
         try:
-            import cycle_state as cycle_state_mod
             conn = state.connect()
             try:
                 row = conn.execute(
