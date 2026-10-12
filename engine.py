@@ -832,11 +832,12 @@ class TradingEngine:
                 detail += (f"; {len(skipped)} skipped by the risk engine/guard "
                            "rails.")
             self.log(f"{label or 'Auto'}: {detail}")
-        elif planned:
+        elif summary["planned"]:
             # Planned trades that booked nothing is never normal: say so loudly
             # instead of leaving a cycle that looks like it simply found nothing.
-            self.log(f"\u26a0\ufe0f {label or 'Auto'}: {planned} order(s) planned "
-                     f"but none could be booked - see the warnings above.")
+            self.log(f"\u26a0\ufe0f {label or 'Auto'}: {summary['planned']} "
+                     f"order(s) planned but none could be booked - see the "
+                     f"warnings above.")
         return summary
 
     # -- trade booking -------------------------------------------------------
