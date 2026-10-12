@@ -50,7 +50,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -125,6 +125,30 @@ def market_is_open(now_utc=None):
         return bool(tv_data.market_is_open(now_utc or datetime.now(timezone.utc)))
     except Exception:                                       # noqa: BLE001
         return False
+
+
+def seconds_until_open(now_utc=None):
+    """Seconds until the next weekday 09:30 ET open, or None if unknowable.
+
+    Used to turn a trigger that lands before the bell into useful cover instead
+    of a wasted slot: the run waits, then trades the session. Holidays are not
+    modelled (see tv_data), so a holiday looks like a normal day here.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if market_is_open(now_utc):
+        return 0.0
+    try:
+        import tv_data
+        eastern = tv_data.ET
+    except Exception:                                       # noqa: BLE001
+        return None
+    local = now_utc.astimezone(eastern)
+    for day in range(0, 8):
+        bell = datetime.combine(local.date() + timedelta(days=day),
+                                dt_time(9, 30), tzinfo=eastern)
+        if bell.weekday() < 5 and bell > local:
+            return (bell - local).total_seconds()
+    return None
 
 
 def _blank_summary(database="sqlite"):
@@ -325,6 +349,11 @@ def main(argv=None):
                         help="give up --loop after this many hours so the run "
                              "stays inside GitHub's 6-hour job limit "
                              "(default 5)")
+    parser.add_argument("--max-wait-hours", type=float,
+                        default=float(os.environ.get("PAPER_TRADER_MAX_WAIT_HOURS")
+                                      or 4.0),
+                        help="with --loop, wait up to this long for the market "
+                             "to open instead of exiting (default 4)")
     parser.add_argument("--ignore-market-hours", action="store_true",
                         help="run even when the US session is closed "
                              "(testing and manual runs only)")
@@ -349,20 +378,31 @@ def main(argv=None):
     cycles = []
     exit_code = 0
     closed_at_start = not market_is_open()
+    waited = 0.0
 
     if closed_at_start and not args.ignore_market_hours:
         # The whole point of the gate: outside the session this job touches
-        # nothing at all and reports success, so the scheduler can call it as
-        # often as it likes without waking the database or placing stale orders.
-        summary = _blank_summary(database)
-        summary.update({"ok": True, "market": "closed", "seconds": 0.0,
-                        "skipped": "the US market is closed - nothing to do"})
+        # nothing at all - no scan, no feed entry, no order - and reports
+        # success, so the scheduler can call it as often as it likes without
+        # waking the database or placing stale orders. A loop that arrives
+        # before the bell waits for it instead of wasting the slot, but never
+        # beyond --max-wait-hours or its own --max-hours budget.
+        wait = seconds_until_open() if args.loop else None
+        affordable = (wait is not None and 0 < wait
+                       and wait <= args.max_wait_hours * 3600.0
+                       and time.time() + wait < deadline)
+        if not affordable:
+            _nothing_to_do(database, args)
+            return 0
+        waited = wait
         if not args.quiet:
-            print("The US market is closed (Mon-Fri 09:30-16:00 ET). "
-                  "Nothing to scan, nothing to trade - exiting without "
-                  "touching the database.")
-        _report(summary, args, 0, final=True, cycles=0)
-        return 0
+            print(f"The US market is closed (Mon-Fri 09:30-16:00 ET). Waiting "
+                  f"{wait / 60:.0f} min for the 09:30 ET open - nothing is "
+                  f"scanned, logged or traded until then.")
+        _sleep(wait)
+        if not market_is_open():
+            _nothing_to_do(database, args)
+            return 0
 
     while True:
         market_open = market_is_open()
@@ -380,6 +420,8 @@ def main(argv=None):
 
         summary, code = run_tick(args, database=database, cycle=len(cycles) + 1)
         summary["market"] = "open" if market_open else "closed"
+        if waited and not cycles:
+            summary["waited_seconds"] = round(waited, 1)
         cycles.append(summary)
         exit_code = code if code != 0 else exit_code
 
@@ -393,6 +435,18 @@ def main(argv=None):
     if cycles:
         _step_summary(cycles[-1], cycles, len(cycles) if len(cycles) > 1 else None)
     return exit_code
+
+
+def _nothing_to_do(database, args):
+    """The green no-op: outside the session the job touches nothing at all."""
+    summary = _blank_summary(database)
+    summary.update({"ok": True, "market": "closed", "seconds": 0.0,
+                    "skipped": "the US market is closed - nothing to do"})
+    if not args.quiet:
+        print("The US market is closed (Mon-Fri 09:30-16:00 ET). Nothing to "
+              "scan, nothing to trade - exiting without touching the database.")
+    _report(summary, args, 0, final=True, cycles=0)
+    return summary
 
 
 def _report(summary, args, cycle, final=False, cycles=1, history=None):
