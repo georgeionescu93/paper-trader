@@ -9,6 +9,11 @@ docs/
 
 # Deployment secrets and keys - these live on your PC, never in an image.
 deploy/my-deployment.ps1
+# The gitignored credential files: the database URL, the GitHub token, the
+# session secret, the rotated password and the Render API key all live here.
+# Render builds from the repository and never sees them, but a local
+# `docker build` from this folder would, so they must be excluded explicitly.
+deploy/*.txt
 deploy/keys/
 *.key
 *.pub
