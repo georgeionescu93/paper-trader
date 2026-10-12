@@ -649,13 +649,16 @@ class WebApp:
         finally:
             conn.close()
         if external:
+            # This line does two jobs: it tells the reader that a quiet dashboard
+            # is not a stopped trader (the loop lives in GitHub, not here), and it
+            # names the build, so a stale deployment is visible at a glance.
             self.engine.log(
-                "\u23f8\ufe0f In-process scheduler is OFF "
-                "(PAPER_TRADER_ENGINE=off). Cycles run from the external "
-                "scheduler against this same database"
-                + (f"; {len(resumed)} portfolio(s) are armed and waiting: "
-                   + "; ".join(resumed) if resumed else
-                   "; nothing is armed yet") + ".")
+                "\u23f8\ufe0f Trading runs outside this dashboard "
+                "(build 2026-10-12b, PAPER_TRADER_ENGINE=off), against this same "
+                "database: GitHub Actions cycles while the US market is open "
+                "(Mon-Fri 09:30-16:00 ET) and does nothing while it is closed"
+                + (f". Armed: {len(resumed)} portfolio(s): " + "; ".join(resumed)
+                   if resumed else ". Nothing is armed yet"))
             return resumed
         if resumed:
             # Armed means armed: an account that left Trading Mode running gets
