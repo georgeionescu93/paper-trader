@@ -65,13 +65,13 @@ COPY requirements.txt requirements-postgres.txt ./
 # produced an image that silently could not reach PostgreSQL.
 RUN pip install --no-cache-dir -r requirements.txt -r requirements-postgres.txt
 
-# Application code. tv_data.py and engine.py must sit next to
-# paper_trading_app_TV.py - app_web.py imports all three. accounts.py and
-# cloud_llm.py are the multi-user layer and the optional cloud AI client.
-# pg_compat.py / shared_log.py / run_cycle_job.py are the hosted-database
-# backend, the shared activity feed and the external one-shot cycle runner.
-COPY app_web.py accounts.py cloud_llm.py engine.py paper_trading_app_TV.py tv_data.py ./
-COPY pg_compat.py shared_log.py run_cycle_job.py migrate_to_postgres.py ./
+# Application code, copied as a set. tv_data.py and engine.py must sit next to
+# paper_trading_app_TV.py; the hosted-database backend (pg_compat.py,
+# shared_log.py, run_cycle_job.py), the multi-user layer (accounts.py,
+# cloud_llm.py) and cycle_state.py all have to be here too. Naming modules one
+# by one is how cycle_state.py went missing from this image, which would have
+# broken the in-process scheduler the moment anyone switched it on.
+COPY *.py ./
 COPY web/ ./web/
 COPY deploy/ ./deploy/
 
