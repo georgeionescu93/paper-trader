@@ -465,8 +465,26 @@ class Scheduler(threading.Thread):
                 self._wake.clear()
             return
 
+        # Nothing is scanned or traded outside the US regular session, so simply
+        # hosting the dashboard can never place after-hours orders at prices that
+        # stopped moving when the bell rang. run_cycle_job.py enforces the same
+        # rule for the external scheduler.
+        if not _market_is_open():
+            if self._wake.wait(60.0):
+                self._wake.clear()
+            return
+
         cycle = self.engine.cycle_count + 1
-        results = self.engine.run_cycle_many(due, cycle)
+        # The external job may be trading at this very moment, and two cycles on
+        # the same portfolio would double its orders. The advisory lock is what
+        # keeps them apart, so it has to wrap the cycle itself - not only the
+        # manual "run now" button.
+        with _cycle_lock(timeout=5.0) as lock:
+            if not lock.held:
+                if self._wake.wait(5.0):
+                    self._wake.clear()
+                return
+            results = self.engine.run_cycle_many(due, cycle)
         self._reschedule(due, results, generation, cycle)
         for res in results.get("profiles", []):
             self._publish_decisions(res)
@@ -1096,6 +1114,20 @@ def _engine_is_external():
     """
     return (os.environ.get("PAPER_TRADER_ENGINE") or "").strip().lower() in (
         "off", "0", "false", "no", "none", "external")
+
+
+def _market_is_open():
+    """True during the US regular session (Mon-Fri 09:30-16:00 ET).
+
+    The in-process loop respects market hours for the same reason the external
+    job does: hosting the dashboard must not mean trading after hours, at prices
+    that stopped moving when the session closed. Anything unknown counts as
+    closed - a missed scan costs one interval, a stale fill costs money.
+    """
+    try:
+        return bool(app.tv.market_is_open())
+    except Exception:                                       # noqa: BLE001
+        return False
 
 
 def _cycle_lock(timeout=0.0):
