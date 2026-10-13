@@ -1354,27 +1354,39 @@ def build_router():
             extra["market_open"] = bool(tv_data.market_is_open())
         except Exception:                                   # noqa: BLE001
             extra["market_open"] = None
-        try:
-            conn = state.connect()
+        # Which clock answers "when does it run next"? The server-side scheduler
+        # keeps its next run in memory; the external job records one in the
+        # database. Report whichever is actually in charge, and say which it is,
+        # so a null here can never be mistaken for "nothing is scheduled".
+        engine_next = getattr(state.engine, "next_cycle_at", None)
+        if engine_next:
+            extra["next_cycle_due"] = datetime.fromtimestamp(
+                engine_next).strftime("%Y-%m-%d %H:%M:%S")
+            extra["next_cycle_source"] = "server scheduler"
+        else:
             try:
-                row = conn.execute(
-                    "SELECT min(next_run_at) AS next_due FROM cycle_state"
-                ).fetchone()
-                value = None
-                if row is not None:
-                    if hasattr(row, "get"):
-                        value = row.get("next_due")
-                    elif isinstance(row, (list, tuple)):
-                        value = row[0]
-                    else:
-                        value = list(row)[0]
-                extra["next_cycle_due"] = None if value is None else str(value)
-            finally:
-                conn.close()
-        except Exception as exc:                            # noqa: BLE001
-            # Say so rather than pretending there is no schedule.
-            extra["next_cycle_due"] = None
-            extra["schedule_error"] = f"{type(exc).__name__}: {exc}"
+                conn = state.connect()
+                try:
+                    row = conn.execute(
+                        "SELECT min(next_run_at) AS next_due FROM cycle_state"
+                    ).fetchone()
+                    value = None
+                    if row is not None:
+                        if hasattr(row, "get"):
+                            value = row.get("next_due")
+                        elif isinstance(row, (list, tuple)):
+                            value = row[0]
+                        else:
+                            value = list(row)[0]
+                    extra["next_cycle_due"] = None if value is None else str(value)
+                    extra["next_cycle_source"] = "external job" if value else None
+                finally:
+                    conn.close()
+            except Exception as exc:                        # noqa: BLE001
+                # Say so rather than pretending there is no schedule.
+                extra["next_cycle_due"] = None
+                extra["next_cycle_source"] = None
+                extra["schedule_error"] = f"{type(exc).__name__}: {exc}"
         extra["engine_setting"] = os.environ.get("PAPER_TRADER_ENGINE") or "(unset)"
         h._json({"ok": True, "engine_running": state.engine.running,
                  "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
