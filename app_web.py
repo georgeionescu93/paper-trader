@@ -1355,14 +1355,21 @@ def build_router():
         except Exception:                                   # noqa: BLE001
             extra["market_open"] = None
         # Which clock answers "when does it run next"? The server-side scheduler
-        # keeps its next run in memory; the external job records one in the
-        # database. Report whichever is actually in charge, and say which it is,
-        # so a null here can never be mistaken for "nothing is scheduled".
-        engine_next = getattr(state.engine, "next_cycle_at", None)
+        # keeps its next run in memory (that is what the dashboard countdown
+        # shows); the external job records one in the database. Report whichever
+        # is actually in charge, and say which it is, so a null here can never be
+        # mistaken for "nothing is scheduled". Note the scheduler owns the clock,
+        # not the engine inside it.
+        sched = getattr(state, "scheduler", None)
+        engine_next = getattr(sched, "next_cycle_at", None)
         if engine_next:
             extra["next_cycle_due"] = datetime.fromtimestamp(
                 engine_next).strftime("%Y-%m-%d %H:%M:%S")
             extra["next_cycle_source"] = "server scheduler"
+            try:
+                extra["next_cycle_in_s"] = int(sched.next_in())
+            except Exception:                               # noqa: BLE001
+                pass
         else:
             try:
                 conn = state.connect()
