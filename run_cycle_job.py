@@ -26,8 +26,8 @@ polls every --every-seconds (default 60) and runs a cycle whenever a portfolio i
 actually due - cycle_state owns that decision, so a poll that finds nothing due
 costs a millisecond and changes nothing. The loop stops when the session closes
 or when --max-hours is reached (default 5.0, comfortably inside GitHub's 6-hour
-job limit); the next scheduled run then picks the session back up. Pass
---ignore-market-hours, or --force after hours, to override the gate.
+job limit); the successor relay (or scheduled recovery trigger) then takes over.
+Pass --ignore-market-hours, or --force after hours, to override the gate.
 
 It does exactly what Scheduler._tick() does in the web build: read the armed
 accounts from the database, scan the market ONCE, and apply that one scan to
@@ -225,8 +225,10 @@ def run_tick(args, database="sqlite", cycle=1):
             # tick, so without it every tick would re-scan the whole universe
             # instead of once per timeframe interval (see cycle_state.py).
             cycle_state.ensure_table(conn)
-            due = cycle_state.due_profiles(
-                [row["profile_id"] for row in armed], conn=conn)
+            due_tokens = cycle_state.due_profile_tokens(
+                [row["profile_id"] for row in armed], conn=conn,
+                include_all=bool(args.ignore_schedule))
+            due = set(due_tokens)
         except Exception as exc:                            # noqa: BLE001
             summary["error"] = (f"could not determine due portfolios: "
                                 f"{type(exc).__name__}: {exc}")
@@ -236,7 +238,9 @@ def run_tick(args, database="sqlite", cycle=1):
             conn.close()
         summary["armed"] = len(armed)
         entries = [{"profile_id": row["profile_id"], "label": row["label"],
-                    "tag": row["email"], "user_id": row["user_id"]}
+                    "tag": row["email"], "user_id": row["user_id"],
+                    "cycle_key": f"external:{row['label']}:"
+                                 f"{due_tokens.get(row['profile_id'], 'manual')}"}
                    for row in armed
                    if args.ignore_schedule or row["profile_id"] in due]
         owners = {entry["profile_id"]: entry["user_id"] for entry in entries}
@@ -468,7 +472,7 @@ def main(argv=None):
         if cycles and not args.ignore_market_hours and time.time() >= deadline:
             if not args.quiet:
                 print(f"Reached --max-hours ({args.max_hours}h) with the market "
-                      f"still open - the next scheduled run takes over.")
+                      f"still open - the successor relay takes over.")
             break
         if cycles and args.ignore_market_hours and time.time() >= deadline:
             break

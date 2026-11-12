@@ -297,7 +297,7 @@ class TradingEngine:
             conn.rollback()
             raise
 
-    def apply_cycle(self, pid, label, cfg, cycle, scan, tag=""):
+    def apply_cycle(self, pid, label, cfg, cycle, scan, tag="", cycle_key=None):
         """One portfolio's half of a cycle, against an existing scan.
 
         The order is not arbitrary and must not be rearranged:
@@ -533,7 +533,7 @@ class TradingEngine:
                 cooldown_hours=cfg["cooldown_h"], risk_state=risk,
                 quiet=True, profile_id=pid,
                 cash_reserve_pct=app.AUTO_CASH_RESERVE_PCT,
-                max_position_pct=app.MAX_POSITION_PCT)
+                max_position_pct=app.MAX_POSITION_PCT, cycle_key=cycle_key)
             executed = summary["executed"]
 
             scanned = len(results)
@@ -725,7 +725,8 @@ class TradingEngine:
                 tag = entry.get("tag", "")
                 try:
                     res = self.apply_cycle(entry["profile_id"], entry["label"],
-                                           entry["cfg"], cycle, scan, tag)
+                                           entry["cfg"], cycle, scan, tag,
+                                           cycle_key=entry.get("cycle_key"))
                 except Exception as exc:              # noqa: BLE001
                     self.last_error = f"{type(exc).__name__}: {exc}"
                     self.log(f"\u274c cycle failed for "
@@ -951,7 +952,8 @@ class TradingEngine:
     def execute_auto_trades(self, recs, prices, label=None,
                             cooldown_hours=app.AUTO_TRADE_COOLDOWN_HOURS,
                             risk_state=None, quiet=True, profile_id=None,
-                            cash_reserve_pct=None, max_position_pct=None):
+                            cash_reserve_pct=None, max_position_pct=None,
+                            cycle_key=None):
         """Executes the recommendations that survive the guard rails.
 
         Returns a summary dict: {executed, buys, sells, skipped[]}.
@@ -973,7 +975,9 @@ class TradingEngine:
                                   stop_loss=order.get("stop_loss"),
                                   take_profit=order.get("take_profit"),
                                   risk_per_share=order.get("risk_per_share"),
-                                  profile_id=pid):
+                                  profile_id=pid,
+                                  order_key=(f"{cycle_key}:{order['action']}:{order['symbol']}"
+                                             if cycle_key else None)):
                 executed += 1
                 if order["action"] == "BUY":
                     buys += 1
@@ -1002,7 +1006,8 @@ class TradingEngine:
     # -- trade booking -------------------------------------------------------
     def process_trade(self, action, symbol, qty, price, is_auto=False,
                       reason="", refresh=False, stop_loss=None,
-                      take_profit=None, risk_per_share=None, profile_id=None):
+                      take_profit=None, risk_per_share=None, profile_id=None,
+                      order_key=None):
         """Books a trade atomically with its cash, position and history.
 
         The profile row is the transaction lock. A BUY first debits cash with a
@@ -1037,6 +1042,28 @@ class TradingEngine:
         conn = app.get_db_connection()
         try:
             cursor = conn.cursor()
+            if order_key:
+                # The key row and the cash/position/trade writes share one
+                # transaction. A hard kill therefore leaves either ALL of them
+                # or NONE of them. A retry with the same persisted due token
+                # sees this key and treats the already-booked order as done.
+                order_key = str(order_key)[:240]
+                cursor.execute(
+                    "CREATE TABLE IF NOT EXISTS automatic_order_keys ("
+                    "profile_id INTEGER NOT NULL, order_key TEXT NOT NULL, "
+                    "action TEXT NOT NULL, symbol TEXT NOT NULL, "
+                    "created_at TEXT NOT NULL, "
+                    "PRIMARY KEY (profile_id, order_key))")
+                try:
+                    cursor.execute(
+                        "INSERT INTO automatic_order_keys (profile_id, order_key, "
+                        "action, symbol, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (pid, order_key, action, symbol, stamp))
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                    self.log(f"↷ {action} {symbol} was already booked for this "
+                             "schedule token; skipping the duplicate.")
+                    return True
             realized_pnl = 0.0
             if action == "BUY":
                 # Atomic on SQLite and PostgreSQL. A concurrent writer blocks on
@@ -1166,6 +1193,13 @@ class TradingEngine:
         conn = app.get_db_connection()
         try:
             cursor = conn.cursor()
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS automatic_order_keys ("
+                "profile_id INTEGER NOT NULL, order_key TEXT NOT NULL, "
+                "action TEXT NOT NULL, symbol TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, PRIMARY KEY (profile_id, order_key))")
+            cursor.execute("DELETE FROM automatic_order_keys WHERE profile_id = ?",
+                           (pid,))
             cursor.execute("DELETE FROM profiles WHERE id = ?", (pid,))
             conn.commit()
             deleted = cursor.rowcount > 0

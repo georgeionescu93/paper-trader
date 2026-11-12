@@ -105,11 +105,16 @@ def reset(profile_id):
         pass                                                # advisory only
 
 
-def due_profiles(profile_ids, now=None, conn=None):
-    """Which of these portfolios are due (never run, or past their due time)."""
+def due_profile_tokens(profile_ids, now=None, conn=None, include_all=False):
+    """Due ids mapped to their persisted due-time idempotency tokens.
+
+    The token stays unchanged until mark_ran publishes a new next_run_at. If a
+    worker dies after an order commits but before that publication, its retry
+    therefore receives the SAME token and cannot book that order twice.
+    """
     ids = [int(p) for p in profile_ids if p is not None]
     if not ids:
-        return set()
+        return {}
     own = conn is None
     try:
         conn = conn or _connect()
@@ -123,18 +128,21 @@ def due_profiles(profile_ids, now=None, conn=None):
             if own:
                 conn.close()
     except Exception as exc:                                   # noqa: BLE001
-        # Guessing "everything is due" can repeat trades far before their
-        # interval. Let the job fail visibly and retry on the next poll instead.
         raise RuntimeError("could not read the persistent cycle schedule; "
                            "refusing to guess due times") from exc
     stamp = _stamp(now)
     planned = {int(row[0]): (row[1] or "") for row in rows}
-    due = set()
+    due = {}
     for pid in ids:
         when = planned.get(pid)
-        if not when or when <= stamp:
-            due.add(pid)
+        if include_all or not when or when <= stamp:
+            due[pid] = when or "never"
     return due
+
+
+def due_profiles(profile_ids, now=None, conn=None):
+    """Which of these portfolios are due (never run, or past their due time)."""
+    return set(due_profile_tokens(profile_ids, now=now, conn=conn))
 
 
 def mark_ran(profile_id, user_id=None, next_run_at=None, cycle=None, label=None,

@@ -223,6 +223,13 @@ live prices, held-position quotes, or required timeframe context make the cycle
 degraded and block new entries; valid protective SELLs still run when possible.
 Every failed/degraded cycle exits nonzero.
 
+External automatic orders also carry a durable `(profile, persisted due time,
+action, symbol)` key. The key, cash, position and trade commit in one transaction.
+If a runner is hard-killed after a booking but before due-time publication, its
+retry skips that committed order and can resume the rest instead of charging or
+selling twice. Due-check, cycle and due-publication are covered by one PostgreSQL
+session advisory lock. Manual browser orders intentionally have no such key.
+
 ## Everyday operations
 
 | I want to... | do this |

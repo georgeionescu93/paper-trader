@@ -121,6 +121,35 @@ class EngineFailureModes(unittest.TestCase):
         self.assertIsNone(self.position())
         self.assertAlmostEqual(self.cash(), 899.55, places=2)
 
+    def test_schedule_token_prevents_duplicate_buy_and_sell(self):
+        key = "external:Auto:2026-11-12 20:19:00"
+        self.assertTrue(self.eng.process_trade(
+            "BUY", "AAA", 2, 10, profile_id=self.pid,
+            order_key=key + ":BUY:AAA"))
+        self.assertTrue(self.eng.process_trade(
+            "BUY", "AAA", 2, 10, profile_id=self.pid,
+            order_key=key + ":BUY:AAA"))
+        self.assertAlmostEqual(self.cash(), 980, places=6)
+        self.assertAlmostEqual(float(self.position()[0]), 2, places=6)
+        self.assertTrue(self.eng.process_trade(
+            "SELL", "AAA", 2, 12, profile_id=self.pid,
+            order_key=key + ":SELL:AAA"))
+        self.assertTrue(self.eng.process_trade(
+            "SELL", "AAA", 2, 12, profile_id=self.pid,
+            order_key=key + ":SELL:AAA"))
+        self.assertAlmostEqual(self.cash(), 1004, places=6)
+        self.assertIsNone(self.position())
+        conn = app.get_db_connection()
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM trades WHERE profile_id = ?",
+                                 (self.pid,)).fetchone()[0]
+            keys = conn.execute("SELECT COUNT(*) FROM automatic_order_keys "
+                                "WHERE profile_id = ?", (self.pid,)).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(count, 2)
+        self.assertEqual(keys, 2)
+
     def test_generic_candle_price_is_not_executable(self):
         rec = candidate()
         scan = scan_for(rec)                 # deliberately NO live_prices
@@ -310,7 +339,8 @@ class CompatibilityAndSchedulerTests(unittest.TestCase):
                  {"profile_id": 1, "label": cycle_state.DEFAULT_LABEL,
                   "email": "nobody@example.test", "user_id": 1}]), \
              mock.patch.object(cycle_state, "ensure_table", return_value=None), \
-             mock.patch.object(cycle_state, "due_profiles", return_value={1}), \
+             mock.patch.object(cycle_state, "due_profile_tokens",
+                               return_value={1: "2026-11-12 20:00:00"}), \
              mock.patch.object(cycle_state, "next_after", return_value="tomorrow"), \
              mock.patch.object(cycle_state, "mark_ran", side_effect=failed_mark), \
              mock.patch.object(engine, "TradingEngine", return_value=fake_engine), \
