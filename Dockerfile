@@ -93,4 +93,4 @@ sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:' + port + '/api/health',
 # --host 0.0.0.0 inside the container; publish it to the host loopback only
 # and put a TLS reverse proxy in front of it (see deploy/nginx.conf). PORT is
 # honoured when the platform provides one (Render does), otherwise 8080.
-CMD ["sh", "-c", "python app_web.py --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["sh", "-c", "exec python app_web.py --host 0.0.0.0 --port ${PORT:-8080}"]

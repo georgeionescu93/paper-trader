@@ -16,7 +16,7 @@ are they allowed to see and arm".
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 # The account that adopts whatever single-user data already existed. It is
 # created from the password the app prints on first start, so the owner can log
@@ -47,7 +47,7 @@ USERS_COLUMNS = ("armed_profile_id INTEGER",)
 
 
 def _now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _columns(conn, table):
@@ -79,6 +79,29 @@ def ensure_schema(conn, owner_password_hash=None, owner_email=None,
     conn.execute("CREATE INDEX IF NOT EXISTS idx_profiles_user "
                  "ON profiles(user_id)")
 
+    # SQLite's original UNIQUE COLLATE NOCASE cannot be carried verbatim to
+    # PostgreSQL. Normalize existing rows, reject ambiguous duplicates without
+    # deleting anybody's data, then enforce the same invariant on both engines.
+    email_rows = conn.execute("SELECT id, email FROM users ORDER BY id").fetchall()
+    seen = {}
+    duplicates = []
+    for uid, stored_email in email_rows:
+        normalized = str(stored_email).strip().lower()
+        if normalized in seen:
+            duplicates.append((seen[normalized], uid, normalized))
+        seen[normalized] = uid
+    if duplicates:
+        raise RuntimeError(
+            "Case-variant duplicate login emails require a manual account merge; "
+            f"refusing to delete or combine portfolios automatically: {duplicates}")
+    for uid, stored_email in email_rows:
+        normalized = str(stored_email).strip().lower()
+        if stored_email != normalized:
+            conn.execute("UPDATE users SET email = ? WHERE id = ?",
+                         (normalized, uid))
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower "
+                 "ON users (lower(email))")
+
     row = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
     if row is None:
         if not owner_password_hash:
@@ -87,7 +110,7 @@ def ensure_schema(conn, owner_password_hash=None, owner_email=None,
         cursor = conn.execute(
             "INSERT INTO users (email, password_hash, created_at, is_owner) "
             "VALUES (?, ?, ?, 1)",
-            ((owner_email or DEFAULT_OWNER_EMAIL).strip(),
+            ((owner_email or DEFAULT_OWNER_EMAIL).strip().lower(),
              owner_password_hash, _now()))
         owner = cursor.lastrowid
     else:
@@ -160,13 +183,14 @@ def public(user_row):
             "created_at": user_row["created_at"]}
 
 
-def create_user(conn, email, password_hash, is_owner=False):
+def create_user(conn, email, password_hash, is_owner=False, commit=True):
     """Adds an account. Raises sqlite3.IntegrityError if the email is taken."""
     cursor = conn.execute(
         "INSERT INTO users (email, password_hash, created_at, is_owner) "
         "VALUES (?, ?, ?, ?)",
-        (str(email).strip(), password_hash, _now(), 1 if is_owner else 0))
-    conn.commit()
+        (str(email).strip().lower(), password_hash, _now(), 1 if is_owner else 0))
+    if commit:
+        conn.commit()
     return cursor.lastrowid
 
 
@@ -239,7 +263,7 @@ def unique_profile_name(conn, base):
     return f"{base} {int(datetime.now().timestamp())}"
 
 
-def claim(conn, uid, pid):
+def claim(conn, uid, pid, commit=True):
     """Gives an unowned (or already-owned-by-them) portfolio to this user."""
     if owns(conn, uid, pid):
         return True
@@ -249,7 +273,8 @@ def claim(conn, uid, pid):
         return False
     conn.execute("UPDATE profiles SET user_id = ? WHERE id = ?",
                  (int(uid), int(pid)))
-    conn.commit()
+    if commit:
+        conn.commit()
     return True
 
 
@@ -272,12 +297,13 @@ def current_pid(conn, uid):
     return pid
 
 
-def set_current_pid(conn, uid, pid):
+def set_current_pid(conn, uid, pid, commit=True):
     if not owns(conn, uid, pid):
         return False
     conn.execute("UPDATE users SET current_profile_id = ? WHERE id = ?",
                  (int(pid), int(uid)))
-    conn.commit()
+    if commit:
+        conn.commit()
     return True
 
 

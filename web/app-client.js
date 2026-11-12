@@ -312,7 +312,7 @@ function setAuthMode(mode, keepError) {
 }
 
 function showLogin(errorText) {
-  stopPolling();
+  clearClientState();
   $('app-view').classList.add('hidden');
   $('login-view').classList.remove('hidden');
   setAuthMode('login');
@@ -358,6 +358,7 @@ async function submitAuth(event) {
     : { email, password };
   if (register && !S.registrationOpen) body.code = $('register-code').value.trim();
 
+  clearClientState();
   S.authPending = true;
   button.disabled = true;
   $('login-error').textContent = '';
@@ -367,11 +368,12 @@ async function submitAuth(event) {
     S.user = payload.user || S.user;
     $('login-password').value = '';
     if (register) $('register-code').value = '';
-    showApp();
-    renderUser(S.user);
     try {
       await boot();
+      showApp();
+      renderUser(S.user);
     } catch (err) {
+      clearClientState();
       fail(err, 'Could not load the dashboard');
     }
   } catch (err) {
@@ -1165,7 +1167,9 @@ async function trade(action) {
   const button = action === 'BUY' ? $('btn-buy') : $('btn-sell');
   button.disabled = true;
   try {
-    const payload = await api('POST', '/api/trade', { action, symbol, quantity });
+    const payload = await api('POST', '/api/trade', {
+      action, symbol, quantity, profile_id: S.profileId,
+    });
     const price = payload.price !== undefined ? money(payload.price) : '?';
     toast(`${action} executed`, `${action} ${pyG(quantity)} ${symbol} @ ${price} `
       + 'executed.', 'success');

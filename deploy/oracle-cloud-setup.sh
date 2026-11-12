@@ -177,6 +177,11 @@ mkdir -p "$APP_DIR/data"
 rsync -a --delete \
   --exclude '.git' --exclude '__pycache__' --exclude 'data' \
   --exclude '*.pyc' --exclude '.venv' \
+  --exclude '.env' --exclude '.env.*' --exclude 'web_config.json' \
+  --exclude 'paper_trading_app.db*' --exclude 'deploy/*.txt' \
+  --exclude 'deploy/keys' --exclude 'deploy/my-deployment.ps1' \
+  --exclude '*.key' --exclude '*.pem' --exclude 'id_ed25519*' \
+  --exclude 'tv_sp500_cache.json' --exclude 'tv_symbol_cache.json' \
   "$SRC_DIR"/ "$APP_DIR"/
 
 # ---------------------------------------------------------------------------

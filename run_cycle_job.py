@@ -116,9 +116,10 @@ class CycleLock:
 def market_is_open(now_utc=None):
     """True during the US regular session; unknown clocks count as closed.
 
-    tv_data owns the rule (Mon-Fri 09:30-16:00 ET). If it cannot be imported we
-    say "closed", because doing nothing is the safe answer: a missed scan costs
-    one interval, an after-hours scan places orders at stale prices.
+    tv_data owns the rule, including NYSE holidays and early closes. If it
+    cannot be imported we say "closed", because doing nothing is the safe
+    answer: a missed scan costs one interval, an after-hours scan places orders
+    at stale prices.
     """
     try:
         import tv_data
@@ -128,12 +129,7 @@ def market_is_open(now_utc=None):
 
 
 def seconds_until_open(now_utc=None):
-    """Seconds until the next weekday 09:30 ET open, or None if unknowable.
-
-    Used to turn a trigger that lands before the bell into useful cover instead
-    of a wasted slot: the run waits, then trades the session. Holidays are not
-    modelled (see tv_data), so a holiday looks like a normal day here.
-    """
+    """Seconds until the next actual NYSE session, or None if unknowable."""
     now_utc = now_utc or datetime.now(timezone.utc)
     if market_is_open(now_utc):
         return 0.0
@@ -143,12 +139,32 @@ def seconds_until_open(now_utc=None):
     except Exception:                                       # noqa: BLE001
         return None
     local = now_utc.astimezone(eastern)
-    for day in range(0, 8):
-        bell = datetime.combine(local.date() + timedelta(days=day),
-                                dt_time(9, 30), tzinfo=eastern)
-        if bell.weekday() < 5 and bell > local:
-            return (bell - local).total_seconds()
+    for day in range(0, 10):
+        bounds = tv_data.market_session_bounds(local.date() + timedelta(days=day))
+        if bounds and bounds[0] > local:
+            return (bounds[0] - local).total_seconds()
     return None
+
+
+def relay_delay(now_utc=None, failure=False, cap_seconds=4 * 3600):
+    """Seconds a successor should wait, or None to stop the off-hours chain.
+
+    During the session a successful five-hour worker hands off immediately; a
+    failed worker backs off for five minutes. Outside the session we only keep
+    a pre-open relay alive when the next actual NYSE open is within four hours.
+    Overnight/weekend chains are deliberately stopped to avoid burning runner
+    hours; the automatic cron triggers are the recovery path.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if market_is_open(now_utc):
+        return 300 if failure else 0
+    if failure:
+        return None
+    wait = seconds_until_open(now_utc)
+    if wait is None or wait > cap_seconds:
+        return None
+    # Wake one minute before the bell, but never use a negative/zero delay.
+    return max(30, int(wait - 60))
 
 
 def _blank_summary(database="sqlite"):
@@ -211,18 +227,25 @@ def run_tick(args, database="sqlite", cycle=1):
             cycle_state.ensure_table(conn)
             due = cycle_state.due_profiles(
                 [row["profile_id"] for row in armed], conn=conn)
+        except Exception as exc:                            # noqa: BLE001
+            summary["error"] = (f"could not determine due portfolios: "
+                                f"{type(exc).__name__}: {exc}")
+            _report(summary, args, cycle)
+            return summary, 1
         finally:
             conn.close()
         summary["armed"] = len(armed)
         entries = [{"profile_id": row["profile_id"], "label": row["label"],
                     "tag": row["email"], "user_id": row["user_id"]}
-                   for row in armed if row["profile_id"] in due]
+                   for row in armed
+                   if args.ignore_schedule or row["profile_id"] in due]
         owners = {entry["profile_id"]: entry["user_id"] for entry in entries}
         summary["due"] = len(entries)
         summary["waiting"] = [
             {"profile_id": row["profile_id"], "label": row["label"],
              "email": row["email"]}
-            for row in armed if row["profile_id"] not in due]
+            for row in armed
+            if not args.ignore_schedule and row["profile_id"] not in due]
 
         if not armed and not args.force:
             summary["ok"] = True
@@ -256,7 +279,19 @@ def run_tick(args, database="sqlite", cycle=1):
             pass
 
         try:
-            results = eng.run_cycle_many(entries, cycle)
+            if not entries and args.force and not armed:
+                # --force means a real market scan even with no account armed,
+                # but with no profile there is deliberately nothing to execute.
+                cfg = app.TRADING_TIMEFRAMES[cycle_state.DEFAULT_LABEL]
+                scan = eng.scan_universe(eng.resolved_interval(cfg), [], "forced")
+                results = {"ok": bool(scan.get("ok")),
+                           "scanned": len(scan.get("results") or []),
+                           "decisions": 0, "profiles": [],
+                           "reason": scan.get("reason") or ""}
+                if not results["ok"]:
+                    summary["error"] = results["reason"] or "forced scan failed"
+            else:
+                results = eng.run_cycle_many(entries, cycle)
         except Exception as exc:                            # noqa: BLE001
             summary["error"] = f"{type(exc).__name__}: {exc}"
             try:
@@ -266,38 +301,46 @@ def run_tick(args, database="sqlite", cycle=1):
             _report(summary, args, cycle)
             return summary, 1
 
-    for res in results.get("profiles", []):
-        reason = res.get("reason") or ""
-        failed = (not res.get("ok")) and reason not in ("",
-                                                        "profile no longer exists")
-        summary["profiles"].append({
-            "profile_id": res.get("profile_id"),
-            "label": res.get("label"),
-            "decisions": len(res.get("decisions") or []),
-            "executed": int(res.get("executed") or 0),
-            "reason": reason,
-            "error": reason if failed else None,
-        })
-        # Schedule the next run for this portfolio. A cycle that ran but failed
-        # is retried much sooner than the full interval instead of waiting out
-        # an hour or a day with nothing trading.
-        label = res.get("label") or cycle_state.DEFAULT_LABEL
-        try:
-            if failed:
-                when = cycle_state.next_after(
-                    label, minutes=min(cycle_state.rescan_minutes(label), 15))
-            else:
-                when = cycle_state.next_after(label)
-            cycle_state.mark_ran(res.get("profile_id"),
-                                 owners.get(res.get("profile_id")),
-                                 next_run_at=when, cycle=cycle, label=label)
-        except Exception as exc:                            # noqa: BLE001
-            print(f"  ! could not schedule the next run: "
-                  f"{type(exc).__name__}: {exc}")
-    summary["scanned"] = int(results.get("scanned") or 0)
-    summary["decisions"] = int(results.get("decisions") or 0)
-    summary["executed"] = sum(p["executed"] for p in summary["profiles"])
-    summary["ok"] = not any(p.get("error") for p in summary["profiles"])
+        for res in results.get("profiles", []):
+            reason = res.get("reason") or ""
+            failed = (not res.get("ok")) and reason not in ("",
+                                                            "profile no longer exists")
+            profile = {
+                "profile_id": res.get("profile_id"),
+                "label": res.get("label"),
+                "decisions": len(res.get("decisions") or []),
+                "executed": int(res.get("executed") or 0),
+                "reason": reason,
+                "error": reason if failed else None,
+            }
+            summary["profiles"].append(profile)
+            # Keep due-check -> cycle -> due-publication under ONE session lock.
+            # Otherwise a second scheduler can read the same stale due row and
+            # run sequentially right behind this one.
+            label = res.get("label") or cycle_state.DEFAULT_LABEL
+            try:
+                if failed:
+                    when = cycle_state.next_after(
+                        label, minutes=min(cycle_state.rescan_minutes(label), 15))
+                else:
+                    when = cycle_state.next_after(label)
+                scheduled = cycle_state.mark_ran(
+                    res.get("profile_id"), owners.get(res.get("profile_id")),
+                    next_run_at=when, cycle=cycle, label=label)
+                if not scheduled:
+                    raise RuntimeError("cycle_state.mark_ran returned False")
+            except Exception as exc:                        # noqa: BLE001
+                message = (f"could not schedule portfolio "
+                           f"{res.get('profile_id')}: {type(exc).__name__}: {exc}")
+                profile["error"] = message
+                profile["reason"] = "; ".join(filter(None, [reason, message]))
+                summary["error"] = message
+                print(f"  ! {message}")
+        summary["scanned"] = int(results.get("scanned") or 0)
+        summary["decisions"] = int(results.get("decisions") or 0)
+        summary["executed"] = sum(p["executed"] for p in summary["profiles"])
+        summary["ok"] = (not summary.get("error")
+                         and not any(p.get("error") for p in summary["profiles"]))
     summary["seconds"] = round(time.time() - started, 1)
 
     if not args.quiet:
@@ -372,6 +415,18 @@ def main(argv=None):
             database = "postgresql"
     except ImportError:
         pass
+
+    require_postgres = (os.environ.get("PAPER_TRADER_REQUIRE_POSTGRES") or ""
+                        ).strip().lower() in ("1", "true", "yes")
+    if require_postgres and database != "postgresql":
+        summary = _blank_summary(database)
+        summary["error"] = ("PAPER_TRADER_REQUIRE_POSTGRES is set, but no valid "
+                            "PostgreSQL DATABASE_URL/PAPER_TRADER_DB_URL is "
+                            "configured; refusing the SQLite fallback")
+        _report(summary, args, 0)
+        if not args.quiet:
+            print("FATAL: " + summary["error"], file=sys.stderr)
+        return 2
 
     started = time.time()
     deadline = started + max(0.0, args.max_hours) * 3600.0

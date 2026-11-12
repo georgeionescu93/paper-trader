@@ -28,11 +28,24 @@ window into the database; the work happens in the Actions job.
 * **It works, and it is free**, but it is three free tiers stacked up. Free tiers
   change their rules. Render's own documentation says plainly: *"Do not use them
   for production applications."*
-* **Cycles can be a few minutes late.** GitHub's scheduler is best-effort and in
-  UTC. For a daily or auto timeframe this is irrelevant; for a 1-minute timeframe
-  it is not (see *Cadence* below).
-* **GitHub disables scheduled workflows after ~60 days without repository
-  activity.** Push anything, or run the workflow by hand, to keep it alive.
+* **Cycles can be a few minutes late.** GitHub's scheduler and dispatch API are
+  best-effort and in UTC. A successful five-hour worker self-dispatches its
+  successor with the built-in `GITHUB_TOKEN`; the 15-minute cron remains an
+  automatic recovery path. This was verified with an isolated two-hop,
+  non-trading probe before the relay was enabled.
+* **The relay does not sleep all night.** During the regular session it chains
+  continuously; after a failure it backs off for five minutes. Outside the
+  session it waits only when the next actual NYSE open is within four hours,
+  otherwise it stops and lets pre-open cron resume it. Manual one-off/test runs
+  do not chain.
+* **The schedule needs repository activity.** The workflow writes one small,
+  non-secret `.github/scheduler-heartbeat.json` commit per UTC day so GitHub's
+  roughly-60-day schedule-idle rule does not require a human push. The heartbeat
+  step is non-fatal; its failure must not undo a trading cycle.
+* **A free hosted workflow is not an absolute uptime guarantee.** A disabled
+  workflow/repository, exhausted minutes, GitHub/Neon outages, or an invalid
+  database URL can stop it. Use an always-on VPS plus an independent monitor if
+  that risk is unacceptable.
 * **The database is the only thing that must not be lost.** Everything else can
   be rebuilt from the repository in minutes.
 * **If Neon suspends or the free quota runs out, cycles start failing loudly**
@@ -148,8 +161,9 @@ working.
    | `PAPER_TRADER_REGISTRATION_CODE` | a word, if you do not want open sign-up |
    | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | optional, for AI analysis |
 
-   `PAPER_TRADER_ENGINE=off` is already set by the blueprint: this host serves,
-   it does not trade.
+   `PAPER_TRADER_ENGINE=off` and `PAPER_TRADER_REQUIRE_POSTGRES=1` are already
+   set by the blueprint: this host serves, it does not trade, and it refuses to
+   boot with a silent SQLite fallback.
 4. Deploy and open the URL. Sign in with your existing password.
 
 ## 4. The engine (GitHub Actions, ~2 minutes)
@@ -165,8 +179,11 @@ secret**
 `WEB_URL` is only used to ping the dashboard awake. Without it the workflow still
 trades; the dashboard just takes a minute to wake up when you visit it.
 
-Then **Actions → paper-trader cycle → Run workflow** once, by hand, to confirm it
-works before waiting for the schedule.
+Then **Actions → paper-trader cycle → Run workflow** once, by hand, with
+`mode=loop`, to confirm it works. A `mode=once` run is deliberately a one-off
+and never dispatches a successor. The continuous relay can be disabled without
+disarming accounts by creating repository variable `PAPER_TRADER_RELAY_ENABLED=0`;
+remove it or set another value to re-enable handoffs.
 
 ## 5. Arm a portfolio
 
@@ -178,27 +195,33 @@ cycle and each trade their own ledger.
 
 ---
 
-## Cadence: what the 15-minute cron actually does
+## Cadence and market hours
 
 `run_cycle_job.py` is not a "run everything now" button. Each portfolio carries a
-due time (in the `cycle_state` table), exactly like the desktop build's
-scheduler:
+due time (in `cycle_state`), exactly like the desktop scheduler:
 
-| timeframe | rescans every | with a 15-minute cron |
-|---|---|---|
-| Auto (all timeframes) | 15 min | every tick |
-| 5 minutes | 5 min | every tick |
-| 1 hour | 15 min | every tick |
-| 1 day | 60 min | every 4th tick |
-| 1 month | 360 min | every 24th tick |
+| timeframe | rescan interval |
+|---|---|
+| Auto (all timeframes) | 15 min |
+| 1 or 5 minutes | the selected timeframe, with a 60-second loop check |
+| 1 hour | 15 min |
+| 1 day | 60 min |
+| 1 month | 360 min |
 
-A tick where nothing is due exits in about 2 seconds without touching the market
-data, which is what keeps the free GitHub minutes and Neon compute hours cheap.
-A real cycle scans all 503 S&P 500 symbols and takes roughly 50-60 seconds.
+A tick where nothing is due exits without touching market data. A real cycle
+scans the shared S&P 500 universe once, then applies it independently to each
+armed account. During the session the relay checks every 60 seconds; cron is a
+15-minute recovery trigger, not the only clock.
 
-If you want the 1- and 5-minute timeframes, change the cron in
-`.github/workflows/cycle.yml` to `*/5 * * * *` (GitHub's minimum) - and expect
-~600 runs a day.
+Automatic execution is gated to **09:30-16:00 America/New_York**, Monday-Friday,
+including recurring NYSE holidays, observed fixed holidays, Good Friday and
+13:00 early closes. When the market is closed it does not scan or trade. An
+extraordinary one-day closure is not necessarily known to the built-in calendar;
+monitor the quote provider and disable the workflow if its data is stale. Candle
+closes are signal data only and are never accepted as execution fills. Missing
+live prices, held-position quotes, or required timeframe context make the cycle
+degraded and block new entries; valid protective SELLs still run when possible.
+Every failed/degraded cycle exits nonzero.
 
 ## Everyday operations
 
@@ -209,7 +232,7 @@ If you want the 1- and 5-minute timeframes, change the cron in
 | see what the engine did | the dashboard's activity feed - the job writes its lines into the shared log |
 | see whether cycles are happening | GitHub → Actions → paper-trader cycle (each run ends with a `CYCLE_SUMMARY` line and a run summary) |
 | change the owner password | locally: `py app_web.py --print-env` again with the new hash... or simply `py app_web.py --reset-password` on a machine that can reach the DB, then update `PAPER_TRADER_PASSWORD_HASH` in Render |
-| stop everything | Actions → the workflow → **Disable workflow**. The ledger stays in PostgreSQL, untouched. |
+| stop everything | press **Stop** for each armed account, then Actions → the workflow → **Disable workflow**. Set repository variable `PAPER_TRADER_RELAY_ENABLED=0` first so no queued successor is dispatched. The ledger stays untouched. |
 | move to a real server later | point the VPS at the same `PAPER_TRADER_DB_URL` and let it run with the engine on (see `deploy/ORACLE-STEP-BY-STEP.md`); the code, the schema and the ledger are identical |
 
 **Stopping the Render service does not stop trading** - that is deliberate. To
@@ -226,7 +249,7 @@ stop trades, disarm the portfolio or disable the workflow.
 | Actions run says `no portfolio is due yet` | normal | nothing to do |
 | Actions run says `nothing is armed` | no portfolio in Trading Mode | arm one in the dashboard |
 | dashboard shows old data | the page caches `/api/state` | reload, or press the timeframe again |
-| workflow never runs | scheduled workflows are off (a fork, or 60 days idle) | run it once by hand; push a commit |
+| workflow never runs | scheduled workflows are off, the repository is disabled, or GitHub minutes are exhausted | enable the workflow, inspect Actions/usage, then dispatch one `mode=loop` run; the daily heartbeat reduces idle-schedule disabling |
 
 ## Files this added
 
@@ -235,11 +258,12 @@ stop trades, disarm the portfolio or disable the workflow.
 | `pg_compat.py` | makes the app's existing SQL run on PostgreSQL, unchanged (`sqlite3` is rebound to it when a URL is configured) |
 | `shared_log.py` | puts the engine's activity log in the database, so the dashboard shows what the remote job did |
 | `cycle_state.py` | stores when each portfolio is next due, so the job does not re-scan every tick |
-| `run_cycle_job.py` | one cycle, for an external scheduler; takes the advisory lock, respects due times, prints a JSON summary |
+| `run_cycle_job.py` | external worker: calendar/due-time gates, one advisory lock, live execution quotes, durable due-time publication and nonzero failure summaries |
+| `tests/test_reliability.py`, `tests/test_failure_modes.py` | isolated temporary-ledger regressions; the workflow must pass these before its trading step |
 | `migrate_to_postgres.py` | copies SQLite into PostgreSQL and verifies it |
 | `verify_free_stack.py` | checks a database before you trust it with the ledger |
 | `deploy/push-to-github.py` | publishes this folder to a GitHub repository through the API - **no git needed**, which matters on a machine that does not have git |
-| `.github/workflows/cycle.yml` | the 15-minute trading loop and the keep-alive ping |
+| `.github/workflows/cycle.yml` | test-gated trading loop, bounded successor relay, daily heartbeat and dashboard keep-alive |
 | `render.yaml` | the dashboard service |
 | `requirements-postgres.txt` | `psycopg2-binary`, only needed for a hosted database |
 

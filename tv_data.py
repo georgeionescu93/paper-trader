@@ -42,7 +42,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
@@ -599,7 +599,19 @@ def _fetch_chunk(tv_symbols, interval, bars, timeout_s=60):
         for symbol in tv_symbols:
             stream.add_series(symbol, interval, bars)
         stream.pump(time.time() + timeout_s)
-        return stream.rows(), dict(stream.errors)
+        rows = stream.rows()
+        errors = dict(stream.errors)
+        complete = {}
+        required = max(20, min(int(bars), 200))
+        for ticker, values in rows.items():
+            if ticker not in stream.completed:
+                errors.setdefault(ticker, "candle stream ended before series_completed")
+            elif len(values) < required:
+                errors.setdefault(ticker,
+                                  f"incomplete candle history: {len(values)}/{required}")
+            else:
+                complete[ticker] = values
+        return complete, errors
     except Exception as exc:  # noqa: BLE001
         return {}, {"_chunk": f"{type(exc).__name__}: {exc}"}
     finally:
@@ -745,15 +757,91 @@ def last_completed_bar_age(frame, interval, now_utc=None):
     return None
 
 
+def _nth_weekday(year, month, weekday, occurrence):
+    day = date(year, month, 1)
+    return day + timedelta(days=(weekday - day.weekday()) % 7
+                           + 7 * (occurrence - 1))
+
+
+def _last_weekday(year, month, weekday):
+    day = date(year, month + 1, 1) - timedelta(days=1)
+    return day - timedelta(days=(day.weekday() - weekday) % 7)
+
+
+def _easter_sunday(year):
+    """Gregorian Easter, used only to derive Good Friday."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e, f = b // 4, b % 4, (b + 8) // 25
+    g, h = (b - f + 1) // 3, (19 * a + b - d - (b - f + 1) // 3 + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, day = divmod(h + l - 7 * m + 114, 31)
+    return date(year, month, day + 1)
+
+
+def _observed(day):
+    if day.weekday() == 5:       # Saturday -> Friday
+        return day - timedelta(days=1)
+    if day.weekday() == 6:       # Sunday -> Monday
+        return day + timedelta(days=1)
+    return day
+
+
+def market_holidays(year):
+    """Recurring full-day NYSE closures for a year.
+
+    Rules follow https://www.nyse.com/markets/hours-calendars . In particular a
+    Saturday New Year's Day has NO observed market holiday on the previous
+    Friday, unlike the other fixed-date holidays. Extraordinary closures cannot
+    be predicted here; stale-price checks remain the fallback for those.
+    """
+    new_year = date(year, 1, 1)
+    days = {
+        _nth_weekday(year, 1, 0, 3),              # Martin Luther King Jr Day
+        _nth_weekday(year, 2, 0, 3),              # Washington's Birthday
+        _easter_sunday(year) - timedelta(days=2), # Good Friday
+        _last_weekday(year, 5, 0),                # Memorial Day
+        _nth_weekday(year, 9, 0, 1),              # Labor Day
+        _nth_weekday(year, 11, 3, 4),             # Thanksgiving
+        _observed(date(year, 7, 4)),
+        _observed(date(year, 12, 25)),
+    }
+    if new_year.weekday() != 5:
+        days.add(_observed(new_year))
+    if year >= 2022:
+        days.add(_observed(date(year, 6, 19)))
+    return days
+
+
+def market_session_bounds(day):
+    """Return (open, close) as aware ET datetimes, or None when closed.
+
+    Regular hours are 09:30-16:00 ET. The day after Thanksgiving, Christmas Eve
+    when it is itself a trading day, and July 3 when it is a trading day end at
+    13:00 ET, matching NYSE's published calendar.
+    """
+    if day.weekday() >= 5 or day in market_holidays(day.year):
+        return None
+    close_hour = 16
+    thanksgiving = _nth_weekday(day.year, 11, 3, 4)
+    if day == thanksgiving + timedelta(days=1):
+        close_hour = 13
+    if (day.month == 12 and day.day == 24
+            and day not in market_holidays(day.year)):
+        close_hour = 13
+    if (day.month == 7 and day.day == 3
+            and day not in market_holidays(day.year)):
+        close_hour = 13
+    return (datetime.combine(day, dt_time(9, 30), tzinfo=ET),
+            datetime.combine(day, dt_time(close_hour, 0), tzinfo=ET))
+
+
 def market_is_open(now_utc=None):
-    """US regular session (Mon-Fri 09:30-16:00 ET). Holidays are not modelled
-    here on purpose - freshness checks below catch a closed market instead,
-    which also covers unscheduled halts."""
+    """Whether NYSE's regular session is open at this instant."""
     now = (now_utc or datetime.now(timezone.utc)).astimezone(ET)
-    if now.weekday() >= 5:
-        return False
-    minutes = now.hour * 60 + now.minute
-    return (9 * 60 + 30) <= minutes < (16 * 60)
+    bounds = market_session_bounds(now.date())
+    return bool(bounds and bounds[0] <= now < bounds[1])
 
 
 # ==========================================

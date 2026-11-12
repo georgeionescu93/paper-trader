@@ -40,6 +40,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import mimetypes
 import os
 import re
@@ -286,16 +287,18 @@ class Sessions:
 class LoginThrottle:
     """Simple per-client attempt counter, to make brute force impractical."""
 
-    def __init__(self):
+    def __init__(self, max_attempts=LOGIN_MAX_ATTEMPTS, window=LOGIN_WINDOW_S):
         self._lock = threading.Lock()
         self._hits = {}
+        self.max_attempts = int(max_attempts)
+        self.window = float(window)
 
     def blocked(self, client):
         with self._lock:
             hits = [t for t in self._hits.get(client, [])
-                    if time.time() - t < LOGIN_WINDOW_S]
+                    if time.time() - t < self.window]
             self._hits[client] = hits
-            return len(hits) >= LOGIN_MAX_ATTEMPTS
+            return len(hits) >= self.max_attempts
 
     def record(self, client):
         with self._lock:
@@ -326,7 +329,8 @@ class Scheduler(threading.Thread):
         self._wake = threading.Event()
         self.next_cycle_at = None
         self._lock = threading.Lock()
-        self._generation = 0        # bumped to abandon an in-flight wait
+        self._generation = 0        # wakes an in-flight wait when the set changes
+        self._version_counter = 0   # per-arm identity, not a global due reset
         self._armed = {}            # profile_id -> armed portfolio
 
     # -- control -------------------------------------------------------------
@@ -345,10 +349,11 @@ class Scheduler(threading.Thread):
                           if e["user_id"] == int(user_id)
                           and p != profile_id]:
                 self._armed.pop(other, None)
+            self._version_counter += 1
             self._armed[profile_id] = {
                 "profile_id": profile_id, "label": label,
                 "user_id": int(user_id), "tag": tag,
-                "next_at": time.time(),
+                "next_at": time.time(), "version": self._version_counter,
             }
             self.engine.running = True
             self.engine.profile_id = profile_id
@@ -493,17 +498,16 @@ class Scheduler(threading.Thread):
         """Books the next cycle for every armed portfolio that is still
         armed, and forgets the ones whose profile disappeared."""
         with self._lock:
-            if generation != self._generation:
-                # The armed set changed while the cycle was running; whatever
-                # survived is due again immediately.
-                for entry in due:
-                    if entry["profile_id"] in self._armed:
-                        self._armed[entry["profile_id"]]["next_at"] = time.time()
-                return
+            due_versions = {entry["profile_id"]: entry.get("version")
+                            for entry in due}
             for res in results.get("profiles", []):
                 pid = res.get("profile_id")
                 entry = self._armed.get(pid)
                 if entry is None:
+                    continue
+                # A disarm/rearm of THIS portfolio starts a new schedule. An
+                # unrelated account's generation change has no effect here.
+                if entry.get("version") != due_versions.get(pid):
                     continue
                 if res.get("reason") == "profile no longer exists":
                     self._armed.pop(pid, None)
@@ -577,18 +581,37 @@ class WebApp:
         self.engine.set_db_file(db_file)
         self.sessions = Sessions(self.config["session_secret"])
         self.throttle = LoginThrottle()
+        # Registration uses expensive scrypt and is NOT cleared on success or a
+        # duplicate email: five attempts per client per hour bounds that work.
+        self.registration_throttle = LoginThrottle(max_attempts=5, window=3600)
+        self.registration_slots = threading.BoundedSemaphore(2)
+        self._analysis_attempts = {}
         self.scheduler = Scheduler(self.engine, self.config)
         self.scheduler.app_state = self   # lets a cycle publish its rows
         self._state_lock = threading.Lock()
         self._state_cache = {}            # user id -> (built at, payload)
         self._analysis_lock = threading.Lock()
-        self.analysis = {"running": False, "last_at": None, "last_error": None}
+        self.analysis = {"running": False, "last_at": None, "last_error": None,
+                         "user_id": None, "profile_id": None}
         self._recommendations = {}        # profile id -> rows
         self._recs_lock = threading.Lock()
         self.owner_id = None
         self.current_profile_id = None    # the owner's portfolio
 
     # -- accounts ------------------------------------------------------------
+    def claim_analysis(self, user_id):
+        """Rate-limit operator-funded LLM work independently for each user."""
+        now = time.time()
+        with self._analysis_lock:
+            attempts = [t for t in self._analysis_attempts.get(int(user_id), [])
+                        if now - t < 86400]
+            if attempts and now - attempts[-1] < 60:
+                raise ApiError("Please wait 60 seconds between analyses.", 429)
+            if len(attempts) >= 30:
+                raise ApiError("Daily analysis quota reached (30 per account).", 429)
+            attempts.append(now)
+            self._analysis_attempts[int(user_id)] = attempts
+
     def connect(self):
         """A short-lived connection to the app database."""
         return app.get_db_connection()
@@ -663,7 +686,7 @@ class WebApp:
                 # web host would show an actively traded portfolio as idle.
                 self.scheduler.arm(entry["profile_id"], label,
                                    entry["user_id"], entry["email"])
-                resumed.append(f"{entry['email']} -> {entry['profile_name']}")
+                resumed.append(entry["profile_id"])
         finally:
             conn.close()
         if external:
@@ -675,14 +698,15 @@ class WebApp:
                 "(build 2026-10-12b, PAPER_TRADER_ENGINE=off), against this same "
                 "database: GitHub Actions cycles while the US market is open "
                 "(Mon-Fri 09:30-16:00 ET) and does nothing while it is closed"
-                + (f". Armed: {len(resumed)} portfolio(s): " + "; ".join(resumed)
+                + (f". Armed: {len(resumed)} portfolio(s)."
                    if resumed else ". Nothing is armed yet"))
             return resumed
         if resumed:
             # Armed means armed: an account that left Trading Mode running gets
             # it back after a reboot, and the log names every one of them.
-            self.engine.log("\U0001f504 Trading Mode resumed at startup for: "
-                            + "; ".join(resumed))
+            self.engine.log("\U0001f504 Trading Mode resumed at startup for "
+                            f"{len(resumed)} armed portfolio(s). Account "
+                            "identifiers stay out of the shared activity feed.")
         else:
             self.engine.log("\U0001f504 Trading Mode is idle - nothing is "
                             "armed. Arm it from the page when you want it to "
@@ -692,6 +716,11 @@ class WebApp:
     def stop(self):
         self.scheduler.disarm_all("stopped (server shutting down)")
         self.scheduler.shutdown()
+        if self.scheduler.is_alive():
+            # Give an in-flight booking a bounded chance to commit before the
+            # process exits. Hard platform kills still need the database's
+            # per-order transactions and cross-process lock for safety.
+            self.scheduler.join(timeout=20.0)
 
     # -- recommendations (per portfolio, never global) -----------------------
     def set_recommendations(self, recs, profile_id=None):
@@ -737,12 +766,25 @@ class WebApp:
             risk["rules"] = self.engine.risk_rules()
 
         armed = self.scheduler.armed_profiles()
+        own_armed = bool(armed_pid and armed_pid in armed)
         engine_state = dict(self.engine.status(),
                             next_cycle_in_s=self.scheduler.next_in(),
-                            armed_profiles=armed,
-                            your_profile_armed=bool(armed_pid
-                                                    and armed_pid in armed),
+                            armed_profiles=[armed_pid] if own_armed else [],
+                            your_profile_armed=own_armed,
                             your_armed_profile_id=armed_pid)
+        # Engine status is process-global and may contain another account's last
+        # tag/error. Return only this account's arming state and generic health.
+        engine_state.update({
+            "running": own_armed, "profile_id": armed_pid,
+            "label": (user_row or {}).get("armed_label") if own_armed else None,
+            "last_status": ("Trading Mode is armed for your portfolio."
+                            if own_armed else "No Trading Mode armed for you."),
+            "last_error": None,
+        })
+        analysis = (dict(self.analysis)
+                    if self.analysis.get("user_id") in (None, user_id)
+                    else {"running": False, "last_at": None,
+                          "last_error": None, "user_id": user_id})
         return {
             "ok": True,
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -757,7 +799,7 @@ class WebApp:
             "recommendations": self.get_recommendations(pid),
             "last_scan": self.engine.last_scan,
             "trading_timeframes": self.engine.timeframe_options(),
-            "analysis": dict(self.analysis),
+            "analysis": analysis,
             "auto_mode": next((p["auto_mode"] for p in profiles
                                if p["id"] == pid), 0),
         }
@@ -770,12 +812,15 @@ class WebApp:
 # ===========================================================================
 # 5. AI ANALYSIS (Ollama) - runs off the request thread
 # ===========================================================================
-def run_analysis(app_state, pid, lens="general", use_web=True, is_current=True):
+def run_analysis(app_state, pid, lens="general", use_web=True, is_current=True,
+                 user_id=None):
     eng = app_state.engine
     with app_state._analysis_lock:
         if app_state.analysis["running"]:
             return False
         app_state.analysis["running"] = True
+        app_state.analysis["user_id"] = user_id
+        app_state.analysis["profile_id"] = pid
     eng.log(f"\U0001f916 AI analysis started ({lens} lens)...")
 
     def worker():
@@ -841,26 +886,46 @@ def run_analysis(app_state, pid, lens="general", use_web=True, is_current=True):
             app_state.analysis["last_error"] = None
 
             # If the profile has auto_mode on, the AI's suggestions go through
-            # exactly the same guard rails as the engine's own decisions. Only
-            # the portfolio the caller is actually looking at is touched.
+            # exactly the same guard rails as the engine's own decisions. The
+            # slow LLM call is already done; only this short execution section
+            # holds the cross-process lock and revalidates hours, mode and quotes.
             if recs and is_current:
-                conn = app.get_db_connection()
-                try:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT auto_mode FROM profiles WHERE id = ?",
-                                   (pid,))
-                    row = cursor.fetchone()
-                finally:
-                    conn.close()
-                if row and int(row[0] or 0):
-                    eng.profile_id = pid
-                    summary = eng.execute_auto_trades(
-                        recs, prices, label="\U0001f916 AI auto-trade",
-                        risk_state=eng.risk_state(pid), quiet=True,
-                        profile_id=pid)
-                    if summary["executed"]:
-                        eng.log(f"\U0001f916 AI auto-trade executed "
-                                f"{summary['executed']} order(s).")
+                if not _market_is_open():
+                    eng.log("\u23f8\ufe0f AI auto-trade skipped: the NYSE "
+                            "regular session is closed.")
+                else:
+                    lock = _cycle_lock()
+                    with lock:
+                        if not lock.held:
+                            eng.log("\u26a0\ufe0f AI auto-trade skipped because "
+                                    "another trading cycle holds the lock.")
+                        elif not _market_is_open():
+                            eng.log("\u23f8\ufe0f AI auto-trade skipped: the "
+                                    "market closed while analysis was running.")
+                        else:
+                            conn = app.get_db_connection()
+                            try:
+                                row = conn.execute(
+                                    "SELECT auto_mode FROM profiles WHERE id = ?",
+                                    (pid,)).fetchone()
+                            finally:
+                                conn.close()
+                            if row and int(row[0] or 0):
+                                symbols = list(dict.fromkeys(
+                                    str(r.get("symbol") or "").upper()
+                                    for r in recs if r.get("symbol")))
+                                execution_prices = app.get_stock_prices(symbols)
+                                eng.profile_id = pid
+                                summary = eng.execute_auto_trades(
+                                    recs, execution_prices,
+                                    label="\U0001f916 AI auto-trade",
+                                    risk_state=eng.risk_state(pid), quiet=True,
+                                    profile_id=pid)
+                                if summary["executed"]:
+                                    eng.log(f"\U0001f916 AI auto-trade executed "
+                                            f"{summary['executed']} order(s).")
+                                if summary.get("failed"):
+                                    raise RuntimeError("; ".join(summary["failed"]))
         except Exception as exc:                       # noqa: BLE001
             app_state.analysis["last_error"] = f"{type(exc).__name__}: {exc}"
             eng.log(f"\u274c AI analysis failed: {exc}")
@@ -957,8 +1022,14 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             raise ApiError("Request body too large", 413)
         raw = self.rfile.read(length)
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0]
+        if content_type.strip().lower() != "application/json":
+            raise ApiError("API writes require Content-Type: application/json", 415)
+        def reject_constant(value):
+            raise ValueError(f"non-finite JSON number: {value}")
         try:
-            data = json.loads(raw.decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"),
+                              parse_constant=reject_constant)
         except (ValueError, UnicodeDecodeError):
             raise ApiError("Body must be JSON")
         if not isinstance(data, dict):
@@ -1011,12 +1082,21 @@ class Handler(BaseHTTPRequestHandler):
             self._error(exc.message, exc.status)
         except BrokenPipeError:
             pass
+        except (ValueError, TypeError) as exc:
+            self._error(str(exc) or "Invalid request", 400)
         except Exception as exc:                       # noqa: BLE001
             sys.stderr.write("".join(traceback.format_exc()))
             self._error(f"Internal error: {type(exc).__name__}: {exc}", 500)
 
     # -- API -----------------------------------------------------------------
     def _api(self, method, path, parsed):
+        if method in ("POST", "DELETE"):
+            origin = self.headers.get("Origin")
+            if origin:
+                expected = ("https" if _request_is_https(self) else "http")
+                expected += f"://{self.headers.get('Host', '')}"
+                if origin.rstrip("/") != expected:
+                    raise ApiError("Cross-origin API writes are not allowed.", 403)
         # The body is read BEFORE routing and auth on purpose. On a keep-alive
         # connection (HTTP/1.1 is the default here) an unread body is not
         # discarded: it is parsed as the first line of the NEXT request, so a
@@ -1156,11 +1236,21 @@ def _valid_email(value):
     return bool(re.match(r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$", value or ""))
 
 
-def _cookie_header(token, max_age=SESSION_DAYS * 86400):
-    if not token:
-        return f"{SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0"
-    return (f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; "
-            f"Max-Age={max_age}")
+def _cookie_header(token, max_age=SESSION_DAYS * 86400, secure=False):
+    value = f"{SESSION_COOKIE}={token or ''}"
+    parts = [value, "Path=/", "HttpOnly", "SameSite=Lax",
+             f"Max-Age={max_age if token else 0}"]
+    if secure:
+        # Behind Render's TLS proxy this prevents the browser ever sending the
+        # session over plain HTTP. Local HTTP development leaves it off.
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def _request_is_https(handler):
+    """Whether the browser reached us through TLS, including via a proxy."""
+    forwarded = handler.headers.get("X-Forwarded-Proto", "")
+    return forwarded.split(",", 1)[0].strip().lower() == "https"
 
 
 def _user_of(state, uid):
@@ -1220,9 +1310,22 @@ def _redact_log(state, lines, uid, me_email=None):
         found = match.group(0)
         return found if found == me_email else "another account"
 
+    other_emails = []
+    conn = state.connect()
+    try:
+        other_emails = [str(row[0]) for row in conn.execute(
+            "SELECT email FROM users WHERE id != ?", (uid,)).fetchall()]
+    finally:
+        conn.close()
+
     out = []
     for line in lines:
         text = str(line.get("text") or "")
+        lowered = text.lower()
+        # Tagged operational lines belong to the tagged account. Masking only
+        # the address would still leak that user's trades, errors and timing.
+        if any(email and email.lower() in lowered for email in other_emails):
+            continue
         if "@" in text:
             text = EMAIL_RE.sub(swap, text)
         out.append(dict(line, text=text))
@@ -1279,7 +1382,8 @@ def build_router():
         token = state.sessions.issue(user["id"])
         state.invalidate()
         h._json({"ok": True, "user": accounts.public(user)},
-                extra_headers={"Set-Cookie": _cookie_header(token)})
+                extra_headers={"Set-Cookie": _cookie_header(
+                    token, secure=_request_is_https(h))})
 
     @route("POST", r"/api/register", auth=False)
     def register(h, body, params, query):
@@ -1289,12 +1393,13 @@ def build_router():
         """
         state = h.server.state
         client = h._client()
-        if state.throttle.blocked(client):
-            raise ApiError("Too many attempts. Wait 5 minutes and try again.",
-                           429)
+        if state.registration_throttle.blocked(client):
+            raise ApiError("Too many registration attempts. Wait an hour.", 429)
+        # Count EVERY attempt, including duplicates and successes. Successful
+        # registration never resets this limiter or the login limiter.
+        state.registration_throttle.record(client)
         code = _registration_code()
         if code and str(body.get("code") or "").strip() != code:
-            state.throttle.record(client)
             raise ApiError("That invite code is not right.", 403)
         email = str(body.get("email") or "").strip()
         password = str(body.get("password") or "")
@@ -1306,34 +1411,50 @@ def build_router():
         currency = str(body.get("currency") or "USD").upper()
         if currency not in ("USD", "EUR", "GBP"):
             currency = "USD"
+        if not state.registration_slots.acquire(blocking=False):
+            raise ApiError("Registration is busy; please try again shortly.", 429)
+        try:
+            password_hash = hash_password(password)
+        finally:
+            state.registration_slots.release()
         conn = state.connect()
         try:
             try:
-                uid = accounts.create_user(conn, email, hash_password(password))
+                uid = accounts.create_user(conn, email, password_hash,
+                                           commit=False)
+                # One connection and one transaction: user, initial portfolio,
+                # ownership and selection either all exist or all roll back.
+                base = email.split("@")[0] or "Main"
+                name = accounts.unique_profile_name(conn, base)
+                cursor = conn.execute(
+                    "INSERT INTO profiles (name, currency, balance, auto_mode, "
+                    "total_deposited) VALUES (?, ?, 0, 0, 0)", (name, currency))
+                pid = cursor.lastrowid
+                if not accounts.claim(conn, uid, pid, commit=False):
+                    raise RuntimeError("could not claim the new portfolio")
+                if not accounts.set_current_pid(conn, uid, pid, commit=False):
+                    raise RuntimeError("could not select the new portfolio")
+                conn.commit()
+                user = accounts.user(conn, uid)
             except sqlite3.IntegrityError:
+                conn.rollback()
                 raise ApiError("That e-mail already has an account.", 409)
-            # One portfolio to start with, so the dashboard is usable at once.
-            # The balance is always 0 - Deposit Cash is how money gets in, the
-            # same as the desktop build.
-            base = email.split("@")[0] or "Main"
-            name = accounts.unique_profile_name(conn, base)
-            pid = state.engine.create_profile(name, currency, 0.0)
-            accounts.claim(conn, uid, pid)
-            accounts.set_current_pid(conn, uid, pid)
-            user = accounts.user(conn, uid)
+            except Exception:
+                conn.rollback()
+                raise
         finally:
             conn.close()
-        state.throttle.clear(client)
         token = state.sessions.issue(uid)
         state.invalidate()
         h._json({"ok": True, "user": accounts.public(user),
                  "profile": {"id": pid, "name": name}},
-                extra_headers={"Set-Cookie": _cookie_header(token)})
+                extra_headers={"Set-Cookie": _cookie_header(
+                    token, secure=_request_is_https(h))})
 
     @route("POST", r"/api/logout", auth=False)
     def logout(h, body, params, query):
         h._json({"ok": True}, extra_headers={
-            "Set-Cookie": _cookie_header(None)})
+            "Set-Cookie": _cookie_header(None, secure=_request_is_https(h))})
 
     @route("GET", r"/api/health", auth=False)
     def health(h, body, params, query):
@@ -1375,17 +1496,20 @@ def build_router():
                 conn = state.connect()
                 try:
                     row = conn.execute(
-                        "SELECT min(next_run_at) AS next_due FROM cycle_state"
+                        "SELECT min(next_run_at) AS next_due, "
+                        "max(last_run_at) AS last_run FROM cycle_state"
                     ).fetchone()
-                    value = None
+                    value = last_run = None
                     if row is not None:
                         if hasattr(row, "get"):
-                            value = row.get("next_due")
+                            value, last_run = row.get("next_due"), row.get("last_run")
                         elif isinstance(row, (list, tuple)):
-                            value = row[0]
+                            value, last_run = row[0], row[1]
                         else:
-                            value = list(row)[0]
+                            value, last_run = list(row)
                     extra["next_cycle_due"] = None if value is None else str(value)
+                    extra["last_cycle_at"] = (None if last_run is None
+                                               else str(last_run))
                     extra["next_cycle_source"] = "external job" if value else None
                 finally:
                     conn.close()
@@ -1415,8 +1539,11 @@ def build_router():
         eng = h.server.state.engine
         since = int(query.get("since") or 0)
         lines = _redact_log(h.server.state, eng.log_since(since), h.user_id)
-        h._json({"ok": True, "lines": lines,
-                 "next": eng.status()["log_seq"]})
+        # shared_log uses the database's global row ids, while the in-memory
+        # engine has a different per-process counter. Returning the latter makes
+        # every browser poll fetch the same shared lines again.
+        next_seq = max([since] + [int(line["n"]) for line in lines])
+        h._json({"ok": True, "lines": lines, "next": next_seq})
 
     # ---- engine ------------------------------------------------------------
     @route("POST", r"/api/engine/start")
@@ -1464,6 +1591,9 @@ def build_router():
         cfg = app.TRADING_TIMEFRAMES.get(label)
         if cfg is None:
             raise ApiError(f"Unknown timeframe: {label}")
+        if not _market_is_open():
+            raise ApiError("The NYSE regular session is closed; automatic "
+                           "cycles do nothing until the next session.", 409)
 
         def once():
             lock = _cycle_lock()
@@ -1578,7 +1708,7 @@ def build_router():
     @route("POST", r"/api/trade")
     def trade(h, body, params, query):
         state = h.server.state
-        pid = _pid_for(h)
+        pid = _pid_for(h, body.get("profile_id"))
         action = str(body.get("action") or "").upper()
         if action not in ("BUY", "SELL"):
             raise ApiError("action must be BUY or SELL")
@@ -1589,8 +1719,8 @@ def build_router():
             qty = float(body.get("quantity") or 0)
         except (TypeError, ValueError):
             raise ApiError("Quantity must be a number")
-        if qty <= 0:
-            raise ApiError("Quantity must be greater than zero")
+        if not math.isfinite(qty) or qty <= 0:
+            raise ApiError("Quantity must be a finite number greater than zero")
 
         prices = app.get_stock_prices([symbol])
         price = prices.get(symbol, 0.0) or 0.0
@@ -1640,15 +1770,16 @@ def build_router():
                                (tid,)).fetchone()
             if not row or not accounts.owns(conn, h.user_id, row[0]):
                 raise ApiError("No such trade", 404)
+            pid = int(row[0])
         finally:
             conn.close()
         try:
             new_price = float(body.get("price"))
         except (TypeError, ValueError):
             raise ApiError("price must be a number")
-        if new_price <= 0:
-            raise ApiError("price must be greater than zero")
-        ok, error = edit_trade_price(tid, new_price)
+        if not math.isfinite(new_price) or new_price <= 0:
+            raise ApiError("price must be a finite number greater than zero")
+        ok, error = edit_trade_price(tid, new_price, profile_id=pid)
         if not ok:
             raise ApiError(error or "Could not correct that trade", 400)
         state.invalidate()
@@ -1661,6 +1792,7 @@ def build_router():
         pid = _pid_for(h, body.get("profile_id"))
         if state.analysis["running"]:
             raise ApiError("An analysis is already running.", 409)
+        state.claim_analysis(h.user_id)
         lens = str(body.get("lens") or "general")
         if lens not in ("general", "technical", "fundamental", "combined"):
             lens = "general"
@@ -1672,7 +1804,7 @@ def build_router():
             is_current = accounts.current_pid(conn, h.user_id) == pid
         finally:
             conn.close()
-        run_analysis(state, pid, lens, use_web, is_current)
+        run_analysis(state, pid, lens, use_web, is_current, user_id=h.user_id)
         state.invalidate()
         h._json({"ok": True})
 
@@ -1688,6 +1820,8 @@ def build_router():
 
     @route("POST", r"/api/models")
     def set_model(h, body, params, query):
+        if h.user_id != h.server.state.owner_id:
+            raise ApiError("Only the owner can change the global AI model.", 403)
         model = str(body.get("model") or "").strip()
         if not model:
             raise ApiError("model is required")
@@ -1697,93 +1831,142 @@ def build_router():
     return r
 
 
-def edit_trade_price(trade_id, new_price):
-    """Corrects a historical trade's price, keeping cash and positions
-    consistent: the cash delta is re-applied, the average cost is recomputed
-    for BUYs, and the realized P/L is recomputed for SELLs."""
+def edit_trade_price(trade_id, new_price, profile_id=None):
+    """Correct one fill and replay that symbol's ledger chronologically.
+
+    Quantities never change, so cash needs only the corrected row's delta. Cost
+    basis and realized P/L do change downstream: reversing the current position
+    through the old ledger recovers the basis before the first recorded trade
+    (including when history was cleared), then replaying with the new price
+    recomputes every affected SELL and the final average cost.
+    """
+    try:
+        new_price = float(new_price)
+    except (TypeError, ValueError):
+        return False, "price must be a number"
+    if not math.isfinite(new_price) or new_price <= 0:
+        return False, "price must be a finite number greater than zero"
     conn = app.get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT profile_id, action, symbol, quantity, price, "
-                       "total FROM trades WHERE id = ?", (trade_id,))
-        row = cursor.fetchone()
+        if profile_id is None:
+            row = cursor.execute("SELECT profile_id FROM trades WHERE id = ?",
+                                 (trade_id,)).fetchone()
+            if not row:
+                return False, "That trade no longer exists."
+            profile_id = row[0]
+        pid = int(profile_id)
+        # All ledger writers use the profile row as their transaction lock.
+        cursor.execute("UPDATE profiles SET balance = balance WHERE id = ?", (pid,))
+        if cursor.rowcount != 1:
+            return False, "The owning profile no longer exists."
+        row = cursor.execute(
+            "SELECT profile_id, action, symbol, quantity, price, total "
+            "FROM trades WHERE id = ? AND profile_id = ?",
+            (trade_id, pid)).fetchone()
         if not row:
             return False, "That trade no longer exists."
-        pid, action, symbol, qty, old_price, old_total = row
-        qty = float(qty or 0.0)
-        old_price = float(old_price or 0.0)
+        _pid, action, symbol, qty, old_price, old_total = row
+        action, symbol = str(action).upper(), str(symbol).upper()
+        qty, old_price = float(qty or 0.0), float(old_price or 0.0)
         old_total = float(old_total or 0.0)
-        if qty <= 0:
-            return False, ("That row carries no quantity (it is a cash "
+        if action not in ("BUY", "SELL") or not math.isfinite(qty) or qty <= 0:
+            return False, ("That row carries no valid quantity (it may be a cash "
                            "deposit/withdrawal), so it has no price to fix.")
+        if not math.isfinite(old_price) or old_price <= 0:
+            return False, "The stored trade has an invalid old price."
         new_total = qty * new_price
-        delta = new_total - old_total
+        if not math.isfinite(new_total):
+            return False, "corrected trade value is too large"
 
-        cursor.execute("SELECT balance, total_deposited FROM profiles "
-                       "WHERE id = ?", (pid,))
-        prow = cursor.fetchone()
-        if not prow:
-            return False, "The owning profile no longer exists."
-        balance, deposited = float(prow[0]), float(prow[1] or 0.0)
-        # A BUY that now costs more must have been affordable; refuse an edit
-        # that would leave the account overdrawn rather than silently
-        # corrupting the balance.
+        cursor.execute("SELECT balance FROM profiles WHERE id = ?", (pid,))
+        balance = float(cursor.fetchone()[0])
+        cursor.execute("SELECT quantity, avg_price FROM positions "
+                       "WHERE profile_id = ? AND symbol = ?", (pid, symbol))
+        current = cursor.fetchone()
+        current_qty = float(current[0]) if current else 0.0
+        current_avg = float(current[1]) if current else 0.0
+        cursor.execute(
+            "SELECT id, action, quantity, price FROM trades "
+            "WHERE profile_id = ? AND symbol = ? AND action IN ('BUY', 'SELL') "
+            "ORDER BY id", (pid, symbol))
+        ledger = [(int(r[0]), str(r[1]).upper(), float(r[2] or 0),
+                   float(r[3] or 0)) for r in cursor.fetchall()]
+        if not any(r[0] == int(trade_id) for r in ledger):
+            return False, "The corrected trade is missing from the symbol ledger."
+        for _tid, _side, quantity, price in ledger:
+            if (not math.isfinite(quantity) or quantity <= 0
+                    or not math.isfinite(price) or price <= 0):
+                return False, "The symbol ledger contains an invalid fill; fix it first."
+
+        # Reverse the OLD ledger from the current position. SELLs never changed
+        # average cost; reversing a BUY algebraically recovers the prior basis.
+        q, avg = current_qty, current_avg
+        for _tid, side, quantity, price in reversed(ledger):
+            if side == "SELL":
+                q += quantity
+                continue
+            prior_q = q - quantity
+            if prior_q < -1e-6:
+                return False, "Position quantity is inconsistent with its ledger."
+            if prior_q > 1e-9:
+                avg = (q * avg - quantity * price) / prior_q
+            else:
+                avg = 0.0
+            q = max(0.0, prior_q)
+        if not math.isfinite(avg):
+            return False, "The existing cost basis is not finite; repair is required."
+
+        # Replay forward, substituting only the corrected fill.
+        realized_rows = []
+        for tid, side, quantity, price in ledger:
+            fill = new_price if tid == int(trade_id) else price
+            if side == "BUY":
+                new_q = q + quantity
+                avg = ((q * avg + quantity * fill) / new_q
+                       if new_q > 1e-12 else 0.0)
+                q = new_q
+                realized = 0.0
+            else:
+                if quantity > q + 1e-6:
+                    return False, "Replaying this correction would oversell a position."
+                realized = (fill - avg) * quantity
+                q = max(0.0, q - quantity)
+            if not math.isfinite(realized) or not math.isfinite(avg):
+                return False, "The correction produced a non-finite ledger value."
+            realized_rows.append((tid, realized))
+        if abs(q - current_qty) > 1e-5:
+            return False, "Position quantity changed during correction; please retry."
+
+        delta = new_total - old_total
         new_balance = balance - delta if action == "BUY" else balance + delta
-        if new_balance < 0:
+        if not math.isfinite(new_balance):
+            return False, "The correction produced a non-finite cash balance."
+        if new_balance < -1e-9:
             return False, (f"That price would overdraw the account by "
                            f"{abs(new_balance):,.2f}; deposit cash first.")
 
         cursor.execute("UPDATE profiles SET balance = ? WHERE id = ?",
-                       (new_balance, pid))
-        cursor.execute("UPDATE trades SET price = ?, total = ? WHERE id = ?",
-                       (new_price, new_total, trade_id))
-
-        if action == "BUY":
-            # Recompute the average cost of the open lot from its trades.
-            cursor.execute("SELECT id, quantity, price FROM trades WHERE "
-                           "profile_id = ? AND symbol = ? AND action = 'BUY' "
-                           "ORDER BY id", (pid, symbol))
-            buys = cursor.fetchall()
-            cursor.execute("SELECT id, quantity, price FROM trades WHERE "
-                           "profile_id = ? AND symbol = ? AND action = 'SELL' "
-                           "ORDER BY id", (pid, symbol))
-            sells = cursor.fetchall()
-            remaining = sum(float(q or 0) for _i, q, _p in buys) - \
-                sum(float(q or 0) for _i, q, _p in sells)
-            if remaining > 1e-9:
-                # NOTE: the cost must be summed from the price column, which is
-                # the third field of each row - unpacking it as `_p` and then
-                # using a bare `p` raised NameError and made every BUY
-                # correction fail.
-                cost = sum(float(q or 0) * float(price_i or 0)
-                           for _i, q, price_i in buys) - \
-                    sum(float(q or 0) * float(price_i or 0)
-                        for _i, q, price_i in sells)
-                cursor.execute("UPDATE positions SET avg_price = ? WHERE "
-                               "profile_id = ? AND symbol = ?",
-                               (cost / remaining, pid, symbol))
-        elif action == "SELL":
-            # Realized P/L needs the average cost of the lot at sale time.
-            cursor.execute("SELECT avg_price FROM positions WHERE profile_id = ? "
-                           "AND symbol = ?", (pid, symbol))
-            pos = cursor.fetchone()
-            avg = float(pos[0]) if pos else None
-            if avg is None:
-                cursor.execute("SELECT quantity, price FROM trades WHERE "
-                               "profile_id = ? AND symbol = ? AND "
-                               "action = 'BUY' ORDER BY id", (pid, symbol))
-                buys = cursor.fetchall()
-                total_qty = sum(float(q or 0) for q, _p in buys)
-                avg = (sum(float(q or 0) * float(price_i or 0)
-                           for q, price_i in buys) / total_qty
-                       ) if total_qty > 0 else 0.0
-            cursor.execute("UPDATE trades SET realized_pnl = ? WHERE id = ?",
-                           ((new_price - avg) * qty, trade_id))
+                       (max(0.0, new_balance), pid))
+        for tid, realized in realized_rows:
+            if tid == int(trade_id):
+                cursor.execute(
+                    "UPDATE trades SET price = ?, total = ?, realized_pnl = ? "
+                    "WHERE id = ? AND profile_id = ?",
+                    (new_price, new_total, realized, tid, pid))
+            else:
+                cursor.execute("UPDATE trades SET realized_pnl = ? "
+                               "WHERE id = ? AND profile_id = ?",
+                               (realized, tid, pid))
+        if current:
+            cursor.execute("UPDATE positions SET avg_price = ? "
+                           "WHERE profile_id = ? AND symbol = ?",
+                           (avg if q > 1e-9 else 0.0, pid, symbol))
+        elif q > 1e-9:
+            return False, "The open position disappeared during correction; retry."
         conn.commit()
         return True, None
     except Exception as exc:                            # noqa: BLE001
-        # Never fail silently: a correction that does nothing looks to the user
-        # exactly like a button that is broken.
         sys.stderr.write(f"  ! trade price correction failed for trade "
                          f"{trade_id}: {type(exc).__name__}: {exc}\n")
         sys.stderr.write("".join(traceback.format_exc()))
@@ -1791,6 +1974,30 @@ def edit_trade_price(trade_id, new_price):
         return False, f"{type(exc).__name__}: {exc}"
     finally:
         conn.close()
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Threading server with a hard cap on concurrent request workers."""
+    request_queue_size = 64
+
+    def __init__(self, *args, **kwargs):
+        self._worker_slots = threading.BoundedSemaphore(
+            int(os.environ.get("PAPER_TRADER_HTTP_WORKERS") or 32))
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        self._worker_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
 
 
 # ===========================================================================
@@ -1924,6 +2131,13 @@ def main(argv=None):
                              "deployment needs (password hash, session secret) "
                              "and exit")
     args = parser.parse_args(argv)
+
+    if ((os.environ.get("PAPER_TRADER_REQUIRE_POSTGRES") or "").lower()
+            in ("1", "true", "yes") and not POSTGRES):
+        print("FATAL: PAPER_TRADER_REQUIRE_POSTGRES is set, but no valid "
+              "PostgreSQL DATABASE_URL/PAPER_TRADER_DB_URL is configured. "
+              "Refusing to use a disposable SQLite ledger.", file=sys.stderr)
+        return 2
 
     # Single source of truth for the database path. The locked desktop module
     # keeps its own module-level DB_FILE and app.get_db_connection() reads it,
@@ -2075,7 +2289,7 @@ def main(argv=None):
     print("  armed until an account presses Trading Mode. Press Ctrl+C to stop.")
     print("=" * 66)
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd = BoundedThreadingHTTPServer((args.host, args.port), Handler)
     httpd.state = state
     httpd.router = build_router()
     httpd.verbose = args.verbose

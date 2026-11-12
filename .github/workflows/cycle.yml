@@ -1,18 +1,17 @@
 # The trading half of the free stack.
 #
-# The web host (Render's free tier) sleeps when nobody visits and loses its disk
-# whenever it restarts, so the trading loop cannot live there. This workflow is
-# the loop: GitHub starts run_cycle_job.py, which then keeps cycling by itself
-# until the US session closes.
+# Render may sleep, so trading lives here, not in the dashboard. Cron is the
+# automatic recovery trigger. During the NYSE session each five-hour worker
+# dispatches one successor and checks due times every 60 seconds; outside the
+# session only a bounded pre-open relay waits, never an all-night runner.
+# Dashboard visits and manual Run clicks are not required for normal operation.
 #
-# Why a cron AND a loop: GitHub's cron is best-effort and would only fire a few
-# times a day, far too rarely for a 15-minute rescan. So each trigger stays alive
-# for up to five hours, cycling once per due interval, and the next trigger takes
-# over. Between them the market is covered continuously.
+# Stop/disarm accounts in the dashboard. Emergency relay stop: repository
+# variable PAPER_TRADER_RELAY_ENABLED=0; disable the workflow to stop recovery.
+# Neon PostgreSQL is required: production cannot silently fall back to SQLite.
 #
-# Outside the session (Mon-Fri 09:30-16:00 ET) the job stops before it touches
-# the database: no scan, no feed entry, no order. Closed-market runs are green,
-# not failures.
+# Outside the session the worker stops before it touches the database: no scan,
+# no feed entry, no order. Closed-market runs are green, not failures.
 #
 # Setup (once):
 #   1. Add the repository secret DATABASE_URL - the PostgreSQL connection
@@ -68,7 +67,12 @@ on:
         default: false
 
 permissions:
-  contents: read
+  # Write is used only by the once-per-day scheduler-heartbeat commit. The
+  # trading step itself receives DATABASE_URL, not the repository token.
+  contents: write
+  # Proven with an isolated two-hop probe: the built-in token dispatches the
+  # successor. No personal access token is needed for the relay.
+  actions: write
 
 concurrency:
   group: paper-trader-cycle
@@ -87,6 +91,7 @@ jobs:
     env:
       # Shows up in the dashboard's activity feed as the source of the cycle.
       PAPER_TRADER_JOB: "GitHub Actions"
+      PAPER_TRADER_REQUIRE_POSTGRES: "1"
       MODE: ${{ github.event.inputs.mode }}
       EVERY_SECONDS: ${{ github.event.inputs.every_seconds }}
       MAX_HOURS: ${{ github.event.inputs.max_hours }}
@@ -106,7 +111,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-postgres.txt
 
+      - name: Run isolated regression tests
+        env:
+          # Tests must never see the production ledger. They create temporary DBs.
+          DATABASE_URL: ""
+          PAPER_TRADER_DB_URL: ""
+          PAPER_TRADER_REQUIRE_POSTGRES: "0"
+        run: python -m unittest discover -s tests -v
+
       - name: Run trading cycles
+        id: trading
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           # Empty on scheduled runs, where the job falls back to its defaults.
@@ -122,6 +136,58 @@ jobs:
           fi
           echo "python run_cycle_job.py $FLAGS"
           python run_cycle_job.py $FLAGS
+
+      - name: Record daily scheduler heartbeat
+        # Scheduled workflows can be disabled after 60 days without repository
+        # activity. One small automated commit per UTC day keeps that from
+        # requiring a human push. It contains no secrets or portfolio data.
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CYCLE_OUTCOME: ${{ steps.trading.outcome }}
+        run: |
+          python - <<'PY'
+          import base64, datetime, json, os, urllib.error, urllib.request
+          today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+          path = ".github/scheduler-heartbeat.json"
+          url = f"{os.environ['API_URL']}/repos/{os.environ['REPOSITORY']}/contents/{path}"
+          headers = {"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                     "Accept": "application/vnd.github+json",
+                     "X-GitHub-Api-Version": "2022-11-28",
+                     "User-Agent": "paper-trader-heartbeat"}
+          def request(req):
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  raw = response.read().decode()
+                  return response.status, json.loads(raw) if raw.strip() else None
+          sha = None
+          try:
+              status, current = request(urllib.request.Request(url + "?ref=main", headers=headers))
+              sha = current["sha"]
+              remote = json.loads(base64.b64decode(current["content"]))
+              if remote.get("date") == today:
+                  print("Heartbeat already recorded today; no extra commit.")
+                  raise SystemExit(0)
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise
+          payload = {"date": today,
+                     "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                     "run_id": os.environ["RUN_ID"], "run_url": os.environ["RUN_URL"],
+                     "cycle_outcome": os.environ.get("CYCLE_OUTCOME") or "unknown"}
+          body = {"message": f"chore: scheduler heartbeat {today}", "branch": "main",
+                  "content": base64.b64encode(json.dumps(payload, indent=2).encode() + b"\n").decode()}
+          if sha:
+              body["sha"] = sha
+          req = urllib.request.Request(url, method="PUT", headers=headers,
+                                       data=json.dumps(body).encode())
+          status, _ = request(req)
+          print("Daily scheduler heartbeat recorded (HTTP", status, ").")
+          PY
 
       - name: Keep the dashboard awake
         # Render's free web service sleeps after ~15 minutes of inactivity. This
@@ -141,3 +207,55 @@ jobs:
           else
             echo "WEB_URL is not set - skipping the keep-alive ping."
           fi
+
+  relay:
+    # The trading job handed off (or failed), not a browser visit or a person.
+    # One-off/manual test runs and the emergency variable never self-replicate.
+    if: >-
+      always() &&
+      needs.cycle.result != 'cancelled' &&
+      github.event.inputs.mode != 'once' &&
+      github.event.inputs.ignore_market_hours != 'true' &&
+      vars.PAPER_TRADER_RELAY_ENABLED != '0'
+    needs: cycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 260
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Plan a bounded successor
+        id: plan
+        env:
+          FAILED: ${{ needs.cycle.result != 'success' }}
+        run: |
+          delay=$(python - <<'PY'
+          import os
+          from run_cycle_job import relay_delay
+          failed = os.environ.get("FAILED", "").lower() == "true"
+          value = relay_delay(failure=failed)
+          print("" if value is None else int(value))
+          PY
+          )
+          echo "delay=$delay" >> "$GITHUB_OUTPUT"
+          if [ -z "$delay" ]; then
+            echo "Outside the relay window: automatic cron resumes before the next session."
+          else
+            echo "Successor delay: ${delay}s"
+          fi
+
+      - name: Wait and dispatch the successor
+        if: steps.plan.outputs.delay != ''
+        env:
+          DELAY: ${{ steps.plan.outputs.delay }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          sleep "$DELAY"
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$API_URL/repos/$REPOSITORY/actions/workflows/cycle.yml/dispatches" \
+            -d '{"ref":"main","inputs":{"mode":"loop","every_seconds":"60","max_hours":"5","ignore_market_hours":"false"}}'

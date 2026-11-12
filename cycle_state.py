@@ -6,17 +6,16 @@ process for every cron tick, and without a stored due time it would re-scan the
 whole S&P 500 on every tick instead of once per rescan interval - fifteen times
 more trading and fifteen times more database wake-ups than the app intends.
 
-The table is deliberately tiny (one row per portfolio) and purely advisory:
-losing it costs one extra cycle, never a missed one. Every read fails OPEN, so
-a database hiccup makes a portfolio due for a cycle rather than silently
-suspending it.
+The table is deliberately tiny (one row per portfolio). Schedule reads fail
+CLOSED: a database hiccup must produce a visible retry, never make every
+portfolio immediately due and trade far ahead of its configured interval.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -45,7 +44,10 @@ def _connect():
 
 
 def _stamp(when=None):
-    return (when or datetime.now()).strftime(STAMP)
+    moment = when or datetime.now(timezone.utc)
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment.strftime(STAMP)
 
 
 def ensure_table(conn=None):
@@ -76,7 +78,10 @@ def next_after(label, now=None, minutes=None):
     failed cycle sooner than the full interval.
     """
     delay = float(minutes) if minutes else rescan_minutes(label)
-    return _stamp((now or datetime.now()) + timedelta(minutes=delay))
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    return _stamp(now + timedelta(minutes=delay))
 
 
 def reset(profile_id):
@@ -117,8 +122,11 @@ def due_profiles(profile_ids, now=None, conn=None):
         finally:
             if own:
                 conn.close()
-    except Exception:                                       # noqa: BLE001
-        return set(ids)                                     # fail open: run them
+    except Exception as exc:                                   # noqa: BLE001
+        # Guessing "everything is due" can repeat trades far before their
+        # interval. Let the job fail visibly and retry on the next poll instead.
+        raise RuntimeError("could not read the persistent cycle schedule; "
+                           "refusing to guess due times") from exc
     stamp = _stamp(now)
     planned = {int(row[0]): (row[1] or "") for row in rows}
     due = set()

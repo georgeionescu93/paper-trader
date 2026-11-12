@@ -51,6 +51,8 @@ services:
       # --- this host only serves; the trading loop is the GitHub workflow ----
       - key: PAPER_TRADER_ENGINE
         value: "off"
+      - key: PAPER_TRADER_REQUIRE_POSTGRES
+        value: "1"
 
       # --- stable secrets (the filesystem here is temporary) ----------------
       - key: PAPER_TRADER_PASSWORD_HASH

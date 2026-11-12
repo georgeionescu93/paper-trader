@@ -34,11 +34,12 @@ any thread: every database operation opens its own short-lived connection, and
 the small amount of shared state is guarded by a lock.
 """
 
+import math
 import os
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import paper_trading_app_TV as app
 
@@ -50,6 +51,19 @@ CURRENCY_SYMBOLS = {"USD": "$", "EUR": "\u20ac", "GBP": "\u00a3"}
 
 def currency_symbol(currency):
     return CURRENCY_SYMBOLS.get(currency or "USD", "$")
+
+
+def _utc_stamp(when=None):
+    """Naive UTC in the ledger's historical format, identical on every host.
+
+    Render and GitHub run in different local timezones. Mixing their wall clocks
+    breaks cooldowns and shared scheduling, so persisted trading timestamps use
+    UTC while the UI remains free to display local time.
+    """
+    moment = when or datetime.now(timezone.utc)
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ===========================================================================
@@ -165,7 +179,10 @@ class TradingEngine:
             conn.commit()
             return len(updates)
         except sqlite3.Error:
-            return 0
+            conn.rollback()
+            # Protective stops are risk controls, not optional bookkeeping. A
+            # failed update must fail the cycle loudly so the scheduler retries.
+            raise
         finally:
             conn.close()
 
@@ -193,8 +210,6 @@ class TradingEngine:
             rows = conn.execute("SELECT symbol FROM positions WHERE "
                                 "profile_id = ?", (pid,)).fetchall()
             return [str(r[0]).upper() for r in rows if r and r[0]]
-        except sqlite3.Error:
-            return []
         finally:
             conn.close()
 
@@ -207,7 +222,8 @@ class TradingEngine:
         """
         stamp = datetime.now().strftime("%H:%M:%S")
         scan = {"ok": False, "universe": [], "snapshot": {}, "results": [],
-                "prices": {}, "timings": None, "fetch_s": None, "reason": ""}
+                "prices": {}, "live_prices": {}, "timings": None,
+                "fetch_s": None, "reason": "", "mtf_ok": True}
         extra = [str(s).upper() for s in extra_symbols if s]
         universe = app.get_market_universe()
         universe = list(dict.fromkeys(list(universe) + extra))
@@ -216,12 +232,18 @@ class TradingEngine:
         snapshot = app.get_market_snapshot(universe, app.AUTO_TIMEFRAMES)
         scan["snapshot"] = snapshot or {}
         if not snapshot:
+            scan["mtf_ok"] = False
+            scan["reason"] = "multi-timeframe scanner snapshot unavailable"
             self.log(f"\U0001f56f\ufe0f [{stamp}] TradingView scanner "
-                     "unreachable - scanning candles without "
-                     "multi-timeframe context.")
+                     "unreachable - protective exits still run, but automatic "
+                     "entries are blocked until multi-timeframe data returns.")
 
-        results, prices, timings = app.scan_market_candles(
+        results, candle_prices, timings = app.scan_market_candles(
             universe, interval, snapshot, True, app.BARS_PER_SCAN)
+        # Candle closes are signal inputs, NEVER execution prices. Start with an
+        # empty live-only map so a partial quote outage cannot silently fill at
+        # the last completed candle's close.
+        prices = {}
         scan["timings"] = timings
         scan["fetch_s"] = (timings or {}).get("fetch_s")
         if not results:
@@ -239,8 +261,41 @@ class TradingEngine:
             if price > 0:
                 prices[symbol] = price
 
-        scan.update({"ok": True, "results": results, "prices": prices})
+        scan.update({"ok": True, "results": results, "prices": prices,
+                     "live_prices": dict(prices)})
         return scan
+
+    def update_risk_state_checked(self, conn, pid, equity):
+        """Persist circuit breakers, then verify they actually reached the DB.
+
+        The frozen desktop helper swallows sqlite errors. That is unacceptable
+        for an unattended hosted engine: a lost daily baseline or peak silently
+        disables the loss limits on the next cycle. Verify the stored row and
+        fail the cycle loudly if it does not match the computed state.
+        """
+        today = (datetime.now(app.tv.ET) if app.tv else
+                 datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+        try:
+            risk = app.update_risk_state(conn, pid, equity, today=today)
+            row = conn.execute(
+                "SELECT day, day_start_equity, peak_equity, halted, halt_reason "
+                "FROM risk_state WHERE profile_id = ?", (pid,)).fetchone()
+            valid = bool(row) and row[0] == today
+            if valid:
+                valid = (math.isclose(float(row[1]), float(risk["day_start_equity"]),
+                                      rel_tol=0, abs_tol=1e-6)
+                         and math.isclose(float(row[2]), float(risk["peak_equity"]),
+                                          rel_tol=0, abs_tol=1e-6)
+                         and bool(row[3]) == bool(risk["halted"])
+                         and (row[4] or "") == (risk["halt_reason"] or ""))
+            if not valid:
+                raise sqlite3.Error(
+                    "circuit-breaker state could not be persisted; entries are "
+                    "not safe until the database write succeeds")
+            return risk
+        except Exception:
+            conn.rollback()
+            raise
 
     def apply_cycle(self, pid, label, cfg, cycle, scan, tag=""):
         """One portfolio's half of a cycle, against an existing scan.
@@ -257,8 +312,11 @@ class TradingEngine:
         interval = self.resolved_interval(cfg)
         who = f"[{tag}] " if tag else ""
         results = scan["results"]
-        prices = scan["prices"]
+        # Only the explicit live-quote channel is executable. `results[*].price`
+        # and any generic/candle price map are analysis data, never fills.
+        prices = dict(scan.get("live_prices") or {})
         timings = scan["timings"]
+        cycle_errors = []
         result = {"ok": False, "decisions": [], "results": results,
                   "prices": prices, "timings": timings, "risk": None,
                   "scanned": len(results), "reason": "", "status": "",
@@ -279,6 +337,24 @@ class TradingEngine:
             # ---- 1. RISK MANAGEMENT FIRST ---------------------------------
             held = list(owned)
             live_prices = app.get_stock_prices(held) if held else {}
+            for symbol, price in (live_prices or {}).items():
+                try:
+                    if math.isfinite(float(price)) and float(price) > 0:
+                        prices[symbol] = float(price)
+                except (TypeError, ValueError):
+                    continue
+            missing_held = []
+            for symbol in held:
+                try:
+                    valid = math.isfinite(float(prices.get(symbol)))
+                except (TypeError, ValueError):
+                    valid = False
+                if not valid or float(prices.get(symbol)) <= 0:
+                    missing_held.append(symbol)
+            if missing_held:
+                cycle_errors.append(
+                    "no live held-position quote for " + ", ".join(missing_held)
+                    + "; new entries blocked and equity may be stale")
             atr_map = {}
             if held:
                 held_snapshot = app.get_market_snapshot(held, ("1D",))
@@ -287,7 +363,12 @@ class TradingEngine:
                         held_snapshot.get(symbol), "atr")
             decisions, stop_updates = app.stop_take_exit_decisions(
                 stops_rows, live_prices, atrs=atr_map)
-            self.apply_stop_updates(pid, stop_updates)
+            try:
+                self.apply_stop_updates(pid, stop_updates)
+            except Exception as exc:                  # noqa: BLE001
+                message = f"protective-stop update failed: {exc}"
+                cycle_errors.append(message)
+                self.log(f"\u26a0\ufe0f {message}; hard-stop exits still run")
             decided_symbols = {d["symbol"] for d in decisions}
 
             # ---- 2. UNIVERSE SCAN -----------------------------------------
@@ -300,7 +381,19 @@ class TradingEngine:
                 q * (prices.get(s, 0.0) or a) for s, q, a in positions)
             conn = app.get_db_connection()
             try:
-                risk = app.update_risk_state(conn, pid, equity)
+                risk = self.update_risk_state_checked(conn, pid, equity)
+            except Exception as exc:                  # noqa: BLE001
+                # A breaker-write failure must block NEW entries, but must never
+                # strand an already-breached hard stop. Continue with a safe
+                # halted state and execute the SELL decisions below.
+                message = f"circuit-breaker persistence failed: {exc}"
+                cycle_errors.append(message)
+                self.last_error = message
+                self.log(f"\u26a0\ufe0f {message}; new entries blocked")
+                risk = {"day": None, "day_start_equity": equity,
+                        "peak_equity": equity, "halted": True,
+                        "halt_reason": "risk state unavailable",
+                        "day_pnl_pct": 0.0, "drawdown_pct": 0.0}
             finally:
                 conn.close()
 
@@ -312,9 +405,9 @@ class TradingEngine:
                         and owned.get(r["symbol"], 0.0) > 0
                         and r["symbol"] not in decided_symbols):
                     qty = owned[r["symbol"]]
-                    price = (prices.get(r["symbol"], r.get("price"))
-                             or r.get("price"))
+                    price = prices.get(r["symbol"], 0.0)
                     if not price or price <= 0:
+                        cycle_errors.append(f"{r['symbol']}: no live execution price")
                         continue
                     decided_symbols.add(r["symbol"])
                     decisions.append({
@@ -336,6 +429,34 @@ class TradingEngine:
                     and r["symbol"] not in decided_symbols]
             buys.sort(key=lambda r: (-r["score"], -r["bull_score"],
                                      r["rsi"] if r["rsi"] is not None else 50))
+            # Every timeframe needs real daily regime context and complete MTF
+            # coverage. Otherwise a missing daily row falls back to a mean of
+            # 200 one-minute bars and can incorrectly look like a daily regime.
+            required = len(app.AUTO_TIMEFRAMES)
+            before = len(buys)
+            context_ok = []
+            for rec in buys:
+                snapshot_row = (scan.get("snapshot") or {}).get(rec["symbol"])
+                close = app._snapshot_value(snapshot_row, "close")
+                ema200 = app._snapshot_value(snapshot_row, "ema200")
+                weekly = app._snapshot_value(snapshot_row, "rec_all_1W")
+                daily_regime = ((close is not None and ema200 is not None)
+                                or weekly is not None)
+                if (scan.get("mtf_ok", False) and daily_regime
+                        and int(rec.get("mtf_total") or 0) >= required):
+                    context_ok.append(rec)
+            buys = context_ok
+            if missing_held:
+                # Without a live value for every existing holding, equity and
+                # its hard stops are not trustworthy enough to add more risk.
+                buys = []
+            if len(context_ok) != before:
+                cycle_errors.append(
+                    "daily/multi-timeframe entry context was unavailable")
+            if before != len(buys):
+                self.log(f"\u26a0\ufe0f {before - len(buys)} entry candidate(s) "
+                         "blocked because daily/multi-timeframe confirmation "
+                         "was unavailable or incomplete.")
 
             # "Auto" adds a real multi-timeframe PATTERN confirmation: the
             # pattern engine runs one timeframe up on the shortlist, and a
@@ -347,7 +468,12 @@ class TradingEngine:
                     confirm)
                 kept = []
                 for r in buys:
-                    ok, why = verdicts.get(r["symbol"], (True, ""))
+                    if r["symbol"] not in verdicts:
+                        cycle_errors.append(
+                            f"{r['symbol']}: higher-timeframe data unavailable")
+                        ok, why = False, "higher-timeframe data unavailable"
+                    else:
+                        ok, why = verdicts[r["symbol"]]
                     if ok:
                         kept.append(r)
                     else:
@@ -358,17 +484,23 @@ class TradingEngine:
                 buys = []
 
             for r in buys[:app.TRADING_MODE_MAX_BUYS]:
-                price = prices.get(r["symbol"], r["price"]) or r["price"]
+                price = prices.get(r["symbol"], 0.0)
                 if not price or price <= 0:
+                    cycle_errors.append(f"{r['symbol']}: no live execution price")
                     continue
                 fill = app.apply_slippage(price, "BUY")
                 stop = r["stop_loss"]
                 if not stop or stop >= fill:
                     continue
+                take_profit = fill + (fill - stop) * app.TAKE_PROFIT_R
+                if not math.isfinite(take_profit) or take_profit <= fill:
+                    continue
                 equity_now = balance + sum(
                     q * (prices.get(s, 0.0) or a) for s, q, a in positions)
                 shares, binding = app.position_size(
                     equity_now, fill, stop, balance,
+                    cash_floor_pct=app.AUTO_CASH_RESERVE_PCT,
+                    max_position_pct=app.MAX_POSITION_PCT,
                     current_position_value=0.0)
                 if shares <= 0:
                     continue
@@ -378,7 +510,7 @@ class TradingEngine:
                     "action": "BUY", "symbol": r["symbol"],
                     "quantity": shares, "amount": shares * fill,
                     "kind": "entry", "stop_loss": stop,
-                    "take_profit": r["take_profit"],
+                    "take_profit": take_profit,
                     "risk_per_share": fill - stop,
                     "reason": (
                         f"\U0001f56f\ufe0f {'+'.join(r['patterns'])}"
@@ -389,7 +521,7 @@ class TradingEngine:
                         f" - new entry sized to risk "
                         f"{app.RISK_PER_TRADE_PCT*100:.2f}% "
                         f"({risk_money:,.0f} = {shares} x {fill - stop:.2f}); "
-                        f"SL {stop:.2f} / TP {r['take_profit']:.2f} "
+                        f"SL {stop:.2f} / TP {take_profit:.2f} "
                         f"[{binding}]"),
                 })
                 # Plan the next entry against the cash this one consumes.
@@ -399,7 +531,9 @@ class TradingEngine:
             summary = self.execute_auto_trades(
                 decisions, prices, label="\U0001f56f\ufe0f Trading Mode",
                 cooldown_hours=cfg["cooldown_h"], risk_state=risk,
-                quiet=True, profile_id=pid)
+                quiet=True, profile_id=pid,
+                cash_reserve_pct=app.AUTO_CASH_RESERVE_PCT,
+                max_position_pct=app.MAX_POSITION_PCT)
             executed = summary["executed"]
 
             scanned = len(results)
@@ -440,6 +574,13 @@ class TradingEngine:
                     status += (f" \u26d4 NEW ENTRIES HALTED: "
                                f"{risk['halt_reason']}.")
 
+            if not scan.get("ok"):
+                status += (f" \u26a0\ufe0f Market scan unavailable "
+                           f"({scan.get('reason') or 'unknown error'}); "
+                           "protective risk checks still ran.")
+            if summary.get("failed"):
+                status += (f" \u26a0\ufe0f {len(summary['failed'])} order(s) "
+                           "could not be booked; the cycle will be retried.")
             self.log(status)
             with self._lock:
                 self.scanned = scanned
@@ -454,11 +595,19 @@ class TradingEngine:
                     "top_blockers": [[v, n] for v, n in top],
                 }
 
-            result.update({"ok": True, "decisions": decisions,
+            reason_parts = [scan.get("reason") or ""] + cycle_errors
+            reason_parts += summary.get("failed") or []
+            reason_parts += [s for s in summary.get("skipped", [])
+                             if "no live price" in s]
+            reason_parts = list(dict.fromkeys(filter(None, reason_parts)))
+            reason = "; ".join(reason_parts)
+            result.update({"ok": bool(scan.get("ok")) and not reason_parts,
+                           "decisions": decisions,
                            "results": results, "prices": prices,
                            "timings": timings, "risk": risk,
                            "scanned": scanned, "status": status,
-                           "executed": executed})
+                           "executed": executed, "execution": summary,
+                           "reason": reason})
             return result
         except Exception as exc:                      # noqa: BLE001
             self.last_error = f"{type(exc).__name__}: {exc}"
@@ -498,12 +647,8 @@ class TradingEngine:
 
             scan = self.scan_universe(self.resolved_interval(cfg),
                                       self.held_symbols(pid), label)
-            if not scan["ok"]:
-                result.update({"results": scan["results"],
-                               "prices": scan["prices"],
-                               "timings": scan["timings"],
-                               "reason": scan["reason"]})
-                return result
+            # apply_cycle always performs held-position risk management, even
+            # when the scan is degraded; new entries fail closed inside it.
             return self.apply_cycle(pid, label, cfg, cycle, scan)
         except Exception as exc:                      # noqa: BLE001
             self.last_error = f"{type(exc).__name__}: {exc}"
@@ -561,25 +706,21 @@ class TradingEngine:
                 scan = self.scan_universe(interval, symbols, labels)
             except Exception as exc:                  # noqa: BLE001
                 self.last_error = f"{type(exc).__name__}: {exc}"
-                self.log(f"\u274c scan failed: {self.last_error}")
-                out["reason"] = self.last_error
-                for entry in entries:
-                    out["profiles"].append(
-                        {"ok": False, "profile_id": entry["profile_id"],
-                         "decisions": [], "reason": self.last_error})
-                continue
+                self.log(f"\u274c scan failed: {self.last_error}; running "
+                         "protective risk checks with live quotes")
+                scan = {"ok": False, "universe": symbols, "snapshot": {},
+                        "results": [], "prices": {}, "timings": None,
+                        "fetch_s": None, "reason": self.last_error,
+                        "mtf_ok": False}
 
             out["scanned"] = max(out["scanned"], len(scan["results"]))
             if scan["fetch_s"] is not None:
                 out["fetch_s"] = scan["fetch_s"]
             if not scan["ok"]:
                 out["reason"] = scan["reason"]
-                for entry in entries:
-                    out["profiles"].append(
-                        {"ok": False, "profile_id": entry["profile_id"],
-                         "decisions": [], "reason": scan["reason"]})
-                continue
-
+                # Do NOT return here. Quotes and candles are independent routes:
+                # existing stops/targets must still be managed with live quotes
+                # even when the entry scan is unavailable.
             for entry in entries:
                 tag = entry.get("tag", "")
                 try:
@@ -602,6 +743,14 @@ class TradingEngine:
             self.last_cycle_s = round(time.time() - started, 1)
             self.last_cycle_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         out["decisions"] = total
+        # One failed portfolio must not be hidden behind another portfolio's
+        # successful cycle: the external scheduler retries whenever ANY failed.
+        out["ok"] = bool(out["profiles"]) and all(
+            bool(profile.get("ok")) for profile in out["profiles"])
+        failures = [str(p.get("reason")) for p in out["profiles"]
+                    if not p.get("ok") and p.get("reason")]
+        if failures:
+            out["reason"] = "; ".join(dict.fromkeys(failures))
         return out
 
     def run_cycle_safe(self, pid, label, cfg, cycle):
@@ -684,7 +833,8 @@ class TradingEngine:
         def hours_since(timestr):
             try:
                 t = datetime.strptime(timestr, "%Y-%m-%d %H:%M:%S")
-                return (datetime.now() - t).total_seconds() / 3600.0
+                return (datetime.now(timezone.utc).replace(tzinfo=None)
+                        - t).total_seconds() / 3600.0
             except (ValueError, TypeError):
                 return 1e9            # unparseable timestamp -> no cooldown
 
@@ -695,7 +845,9 @@ class TradingEngine:
             sym = str(r.get("symbol", "")).strip().upper()
             if not sym:
                 continue
-            price = prices.get(sym, 0.0) or r.get("price") or 0.0
+            # Candle closes are for signals, never for paper fills. Every order
+            # needs a positive live quote from the execution-price route.
+            price = prices.get(sym, 0.0)
             if price <= 0:
                 skipped.append(f"{sym}: no live price")
                 continue
@@ -708,7 +860,8 @@ class TradingEngine:
                 if owned <= 0:
                     skipped.append(f"{sym}: not owned (long-only, no shorting)")
                     continue
-                qty = min(float(r.get("quantity") or 0.0), owned) or owned
+                requested = r.get("quantity")
+                qty = owned if requested is None else min(float(requested), owned)
                 if qty <= 0:
                     skipped.append(f"{sym}: no valid quantity")
                     continue
@@ -720,9 +873,12 @@ class TradingEngine:
                     "reason": r.get("reason", ""), "kind": r.get("kind", "exit"),
                     "stop_loss": None, "take_profit": None,
                     "risk_per_share": None})
-                balance += qty * price
+                # Planning must credit the actual slipped fill, not the raw
+                # quote, or a same-cycle SELL+BUY can plan cash it never receives.
+                balance += qty * app.apply_slippage(price, "SELL")
                 owned_qty[sym] = owned - qty
                 live_value[sym] = owned_qty[sym] * price
+                open_positions = sum(1 for _s, q in owned_qty.items() if q > 0)
                 continue
 
             # ---------------- BUY ----------------
@@ -809,6 +965,7 @@ class TradingEngine:
             risk_state=risk_state, profile_id=pid)
 
         executed = buys = sells = 0
+        failed = []
         for order in orders:
             if self.process_trade(order["action"], order["symbol"], order["qty"],
                                   order["price"], is_auto=True,
@@ -822,9 +979,11 @@ class TradingEngine:
                     buys += 1
                 else:
                     sells += 1
+            else:
+                failed.append(f"{order['action']} {order['symbol']}: booking failed")
 
         summary = {"executed": executed, "buys": buys, "sells": sells,
-                   "skipped": skipped, "planned": len(orders)}
+                   "skipped": skipped, "planned": len(orders), "failed": failed}
         if executed or skipped:
             detail = (f"executed {executed} order(s) - {buys} new position(s), "
                       f"{sells} exit(s) of YOUR holdings")
@@ -844,19 +1003,26 @@ class TradingEngine:
     def process_trade(self, action, symbol, qty, price, is_auto=False,
                       reason="", refresh=False, stop_loss=None,
                       take_profit=None, risk_per_share=None, profile_id=None):
-        """Books a trade: moves cash, updates the position, writes history.
+        """Books a trade atomically with its cash, position and history.
 
-        This is the only place cash and positions change, and it is the same
-        code the desktop app uses. A BUY can never overdraw the account; a SELL
-        can never sell more than is held. Both are enforced here rather than
-        being assumed upstream.
+        The profile row is the transaction lock. A BUY first debits cash with a
+        conditional UPDATE; a SELL locks that row before reading the holding.
+        Browser trades, AI orders and the scheduler therefore cannot spend the
+        same cash or sell the same shares twice, even without the cycle lock.
         """
         pid = profile_id if profile_id is not None else self.profile_id
         if not pid:
             return False
-        if qty is None or price is None or qty <= 0 or price <= 0:
+        try:
+            qty, price = float(qty), float(price)
+        except (TypeError, ValueError):
             return False
-
+        if (not math.isfinite(qty) or not math.isfinite(price)
+                or qty <= 0 or price <= 0):
+            return False
+        for risk_value in (stop_loss, take_profit, risk_per_share):
+            if risk_value is not None and not math.isfinite(float(risk_value)):
+                return False
         action = str(action).upper()
         if action not in ("BUY", "SELL"):
             return False
@@ -864,41 +1030,40 @@ class TradingEngine:
         if not symbol:
             return False
         total_cost = qty * price
+        if not math.isfinite(total_cost):
+            return False
+        stamp = _utc_stamp()
 
         conn = app.get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT balance FROM profiles WHERE id = ?", (pid,))
-            row = cursor.fetchone()
-            if not row:
-                raise sqlite3.Error("Profile not found.")
-            balance = row[0]
             realized_pnl = 0.0
-
             if action == "BUY":
-                if balance < total_cost:
+                # Atomic on SQLite and PostgreSQL. A concurrent writer blocks on
+                # this row and re-evaluates the balance after the first commit.
+                cursor.execute(
+                    "UPDATE profiles SET balance = balance - ? "
+                    "WHERE id = ? AND balance >= ?", (total_cost, pid, total_cost))
+                if cursor.rowcount != 1:
+                    conn.rollback()
                     return False
-                new_balance = balance - total_cost
-                cursor.execute("UPDATE profiles SET balance = ? WHERE id = ?",
-                               (new_balance, pid))
                 cursor.execute(
                     "SELECT quantity, avg_price FROM positions "
                     "WHERE profile_id = ? AND symbol = ?", (pid, symbol))
                 existing = cursor.fetchone()
                 if existing:
-                    old_qty, old_avg = existing
+                    old_qty, old_avg = float(existing[0]), float(existing[1])
                     new_qty = old_qty + qty
                     new_avg = ((old_qty * old_avg) + total_cost) / new_qty
                     cursor.execute(
-                        "UPDATE positions SET quantity = ?, avg_price = ? "
-                        "WHERE profile_id = ? AND symbol = ?",
-                        (new_qty, new_avg, pid, symbol))
+                        "UPDATE positions SET quantity = ?, avg_price = ?, "
+                        "opened_at = ? WHERE profile_id = ? AND symbol = ?",
+                        (new_qty, new_avg, stamp, pid, symbol))
                 else:
                     cursor.execute(
                         "INSERT INTO positions (profile_id, symbol, quantity, "
                         "avg_price, opened_at) VALUES (?, ?, ?, ?, ?)",
-                        (pid, symbol, qty, price,
-                         datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                        (pid, symbol, qty, price, stamp))
                 # Trading Mode entries carry active risk levels; MAX() keeps the
                 # invariant that a protective stop can only ever move UP.
                 if stop_loss is not None or take_profit is not None:
@@ -914,18 +1079,26 @@ class TradingEngine:
                         (stop_loss, stop_loss, take_profit, stop_loss, price,
                          price, risk_per_share, pid, symbol))
             else:                                        # SELL
+                # The no-op update changes nothing but takes the profile's write
+                # lock, serialising this read/modify/write with every other trade.
+                cursor.execute("UPDATE profiles SET balance = balance WHERE id = ?",
+                               (pid,))
+                if cursor.rowcount != 1:
+                    conn.rollback()
+                    return False
                 cursor.execute(
                     "SELECT quantity, avg_price FROM positions "
                     "WHERE profile_id = ? AND symbol = ?", (pid, symbol))
                 existing = cursor.fetchone()
-                if not existing or existing[0] < qty:
+                if (not existing or not math.isfinite(float(existing[0]))
+                        or float(existing[0]) + 1e-9 < qty):
+                    conn.rollback()
                     return False
-                old_qty, old_avg = existing
-                new_qty = old_qty - qty
-                new_balance = balance + total_cost
+                old_qty, old_avg = float(existing[0]), float(existing[1])
+                new_qty = max(0.0, old_qty - qty)
                 realized_pnl = (price - old_avg) * qty
-                cursor.execute("UPDATE profiles SET balance = ? WHERE id = ?",
-                               (new_balance, pid))
+                cursor.execute("UPDATE profiles SET balance = balance + ? "
+                               "WHERE id = ?", (total_cost, pid))
                 if new_qty <= 1e-9:
                     cursor.execute("DELETE FROM positions WHERE profile_id = ? "
                                    "AND symbol = ?", (pid, symbol))
@@ -938,16 +1111,15 @@ class TradingEngine:
                 "INSERT INTO trades (profile_id, trade_time, action, symbol, "
                 "quantity, price, total, reason, realized_pnl) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (pid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), action,
-                 symbol, qty, price, total_cost, reason, realized_pnl))
+                (pid, stamp, action, symbol, qty, price, total_cost, reason,
+                 realized_pnl))
             conn.commit()
+            self.last_error = None
             return True
         except sqlite3.Error as exc:
             conn.rollback()
             # Never fail silently: a swallowed error here means a trade the user
-            # was told about never booked. This is exactly how the hosted build
-            # lost every entry for five days (SQLite's two-argument MAX() is not
-            # a PostgreSQL function, so the protective-stop UPDATE raised).
+            # was told about never booked.
             self.last_error = f"{type(exc).__name__}: {exc}"
             self.log(f"\u26a0\ufe0f could not book {action} {symbol}: "
                      f"{self.last_error}")
@@ -974,6 +1146,8 @@ class TradingEngine:
         if not name:
             raise ValueError("Profile name cannot be empty.")
         balance = float(initial_balance or 0.0)
+        if not math.isfinite(balance):
+            raise ValueError("Initial balance must be a finite number.")
         if balance < 0:
             raise ValueError("Initial balance cannot be negative.")
         conn = app.get_db_connection()
@@ -1004,32 +1178,39 @@ class TradingEngine:
         return deleted
 
     def adjust_funds(self, pid, amount, note=None):
-        """Deposits (positive) or withdraws (negative). Never goes negative."""
+        """Deposits (positive) or withdraws (negative), atomically."""
         amount = float(amount or 0.0)
+        if not math.isfinite(amount):
+            raise ValueError("Amount must be a finite number.")
         if amount == 0:
             raise ValueError("Amount must not be zero.")
+        deposited_increment = amount if amount > 0 else 0.0
         conn = app.get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT balance, currency, total_deposited "
-                           "FROM profiles WHERE id = ?", (pid,))
-            row = cursor.fetchone()
-            if not row:
-                raise ValueError("Profile not found.")
-            balance, currency, deposited = float(row[0]), row[1], float(row[2] or 0)
-            new_balance = balance + amount
-            if new_balance < 0:
+            # One conditional write replaces the old balance read followed by an
+            # unconditional overwrite, so two deposits/withdrawals cannot lose
+            # each other and a withdrawal cannot race cash into negative.
+            cursor.execute(
+                "UPDATE profiles SET balance = balance + ?, "
+                "total_deposited = total_deposited + ? "
+                "WHERE id = ? AND balance + ? >= 0",
+                (amount, deposited_increment, pid, amount))
+            if cursor.rowcount != 1:
+                cursor.execute("SELECT balance FROM profiles WHERE id = ?", (pid,))
+                row = cursor.fetchone()
+                if not row:
+                    raise ValueError("Profile not found.")
                 raise ValueError(
                     f"Cannot withdraw {abs(amount):,.2f}: cash balance is only "
-                    f"{balance:,.2f}.")
-            new_deposited = deposited + amount if amount > 0 else deposited
-            cursor.execute("UPDATE profiles SET balance = ?, total_deposited = ?"
-                           " WHERE id = ?", (new_balance, new_deposited, pid))
+                    f"{float(row[0]):,.2f}.")
+            cursor.execute("SELECT balance FROM profiles WHERE id = ?", (pid,))
+            new_balance = float(cursor.fetchone()[0])
             cursor.execute(
                 "INSERT INTO trades (profile_id, trade_time, action, symbol, "
                 "quantity, price, total, reason, realized_pnl) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (pid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                (pid, _utc_stamp(),
                  "DEPOSIT" if amount > 0 else "WITHDRAW",
                  (note or ("Deposit" if amount > 0 else "Withdrawal"))[:40],
                  0.0, 0.0, amount,
@@ -1037,6 +1218,9 @@ class TradingEngine:
                  0.0))
             conn.commit()
             return new_balance
+        except ValueError:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -1203,7 +1387,7 @@ class TradingEngine:
             "risk_per_trade_pct": app.RISK_PER_TRADE_PCT * 100.0,
             "max_open_positions": app.MAX_OPEN_POSITIONS,
             "max_position_pct": app.MAX_POSITION_PCT * 100.0,
-            "cash_floor_pct": app.CASH_FLOOR_PCT * 100.0,
+            "cash_floor_pct": app.AUTO_CASH_RESERVE_PCT * 100.0,
             "daily_loss_limit_pct": app.DAILY_LOSS_LIMIT_PCT * 100.0,
             "max_drawdown_halt_pct": app.MAX_DRAWDOWN_HALT_PCT * 100.0,
             "take_profit_r": app.TAKE_PROFIT_R,

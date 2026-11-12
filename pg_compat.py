@@ -151,7 +151,8 @@ def set_driver(module):
 _AUTOINC = re.compile(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", re.I)
 _AUTOINC_LOOSE = re.compile(r"\bAUTOINCREMENT\b", re.I)
 _REAL_TYPE = re.compile(r"\bREAL\b", re.I)
-_NOCASE = re.compile(r"(\?|%s|\w+(?:\.\w+)?)\s+COLLATE\s+NOCASE", re.I)
+_NOCASE = re.compile(
+    r"(\w+(?:\.\w+)?)\s*=\s*(\?|%s)\s+COLLATE\s+NOCASE", re.I)
 _NOCASE_PLAIN = re.compile(r"\s+COLLATE\s+NOCASE", re.I)
 _TABLE_INFO = re.compile(
     r"PRAGMA\s+table_info\s*\(\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\s*\)",
@@ -325,9 +326,10 @@ def translate(sql, params=None):
         text = _NOCASE_PLAIN.sub("", text)
         return Statement("ddl", text, params=params)
 
-    # COLLATE NOCASE binds tighter than '=', so `email = ? COLLATE NOCASE`
-    # means a case-insensitive comparison. lower(...) is the portable form.
-    nocase = _scalar_maxmin(_NOCASE.sub(r"lower(\1)", sql))
+    # SQLite's `email = ? COLLATE NOCASE` compares BOTH sides without case.
+    # Lower only the placeholder and an existing mixed-case account can never
+    # log in on PostgreSQL, so both operands must be folded.
+    nocase = _scalar_maxmin(_NOCASE.sub(r"lower(\1) = lower(\2)", sql))
     text, seen = _scan(nocase, escape_percent=params is not None)
     if params is not None and seen == 0:
         # Parameters with no placeholder: they will not be interpolated, so a
@@ -479,11 +481,10 @@ class Cursor:
             self._run(statement, statement.params)
         except Exception as exc:                            # noqa: BLE001
             mapped = _map_exc(exc)
-            # A hosted database drops idle connections (Neon suspends after a
-            # few minutes). Retry once on a fresh connection - but only when
-            # nothing is pending, so a statement can never be applied twice.
-            safe = statement.kind in ("select", "table_info", "noop") \
-                or not was_dirty
+            # Retry only when this connection has performed no writes. Even a
+            # SELECT is unsafe after an UPDATE: reconnecting would roll that
+            # write back and allow later statements to commit without it.
+            safe = not was_dirty
             if isinstance(mapped, OperationalError) and safe \
                     and _retryable(exc):
                 try:

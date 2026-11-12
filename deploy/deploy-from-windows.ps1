@@ -117,6 +117,9 @@ if (-not $SkipUpload) {
                 # The server creates its own config and prints its own owner
                 # password on first start (this script shows it to you).
                 "--exclude=deploy/my-deployment.ps1",
+                "--exclude=deploy/*.txt", "--exclude=deploy/keys",
+                "--exclude=*.key", "--exclude=*.pem", "--exclude=id_ed25519*",
+                "--exclude=.env.*",
                 "--exclude=web_config.json",
                 "--exclude=tv_sp500_cache.json",
                 "--exclude=tv_symbol_cache.json",
