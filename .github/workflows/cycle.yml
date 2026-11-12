@@ -211,12 +211,7 @@ jobs:
   relay:
     # The trading job handed off (or failed), not a browser visit or a person.
     # One-off/manual test runs and the emergency variable never self-replicate.
-    if: >-
-      always() &&
-      needs.cycle.result != 'cancelled' &&
-      github.event.inputs.mode != 'once' &&
-      github.event.inputs.ignore_market_hours != 'true' &&
-      vars.PAPER_TRADER_RELAY_ENABLED != '0'
+    if: ${{ always() && needs.cycle.result != 'cancelled' }}
     needs: cycle
     runs-on: ubuntu-24.04
     timeout-minutes: 260
@@ -224,6 +219,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Plan a bounded successor
+        if: ${{ inputs.mode != 'once' && inputs.ignore_market_hours != true && vars.PAPER_TRADER_RELAY_ENABLED != '0' }}
         id: plan
         env:
           FAILED: ${{ needs.cycle.result != 'success' }}
