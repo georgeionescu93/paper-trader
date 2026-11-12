@@ -219,12 +219,18 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Plan a bounded successor
-        if: ${{ inputs.mode != 'once' && inputs.ignore_market_hours != true && vars.PAPER_TRADER_RELAY_ENABLED != '0' }}
         id: plan
         env:
           FAILED: ${{ needs.cycle.result != 'success' }}
+          MODE: ${{ inputs.mode }}
+          IGNORE_MARKET_HOURS: ${{ inputs.ignore_market_hours }}
+          RELAY_ENABLED: ${{ vars.PAPER_TRADER_RELAY_ENABLED }}
         run: |
-          delay=$(python - <<'PY'
+          echo "Relay policy: mode='${MODE:-schedule}', ignore_hours='${IGNORE_MARKET_HOURS:-false}', enabled='${RELAY_ENABLED:-yes}'"
+          if [ "$MODE" = "once" ] || [ "$IGNORE_MARKET_HOURS" = "true" ] || [ "$RELAY_ENABLED" = "0" ]; then
+            delay=""
+          else
+            delay=$(python - <<'PY'
           import os
           from run_cycle_job import relay_delay
           failed = os.environ.get("FAILED", "").lower() == "true"
@@ -232,6 +238,7 @@ jobs:
           print("" if value is None else int(value))
           PY
           )
+          fi
           echo "delay=$delay" >> "$GITHUB_OUTPUT"
           if [ -z "$delay" ]; then
             echo "Outside the relay window: automatic cron resumes before the next session."
